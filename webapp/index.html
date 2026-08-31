@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>AMANG — кастом-станция</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+  <header class="top">
+    <div class="brand">AMANG <span>custom station</span></div>
+    <div class="quota" id="quota"></div>
+  </header>
+
+  <section class="controls">
+    <div class="sizes" id="sizes"></div>
+    <div class="side-tabs">
+      <button class="side-tab active" data-side="front">Перед</button>
+      <button class="side-tab" data-side="back">Спина</button>
+    </div>
+  </section>
+
+  <section class="stage-wrap">
+    <div class="stage" id="stage">
+      <div class="shirt" id="shirt">
+        <svg id="shirt-svg" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="zone" id="zone">
+          <div class="zone-center"></div>
+        </div>
+      </div>
+    </div>
+    <div class="sel-tools hidden" id="selTools">
+      <button id="btnRotate" title="Повернуть">⟳ 90°</button>
+      <button id="btnDelete" title="Убрать">✕ убрать</button>
+    </div>
+    <div class="hint" id="hint">Добавь принты из каталога и расставь их. Всё в реальном масштабе.</div>
+  </section>
+
+  <footer class="bottom">
+    <button class="catalog-btn" id="btnCatalog">+ Принты</button>
+    <div class="price" id="price"></div>
+    <button class="order-btn" id="btnOrder" disabled>Заказать</button>
+  </footer>
+
+  <!-- Каталог -->
+  <div class="sheet hidden" id="sheet">
+    <div class="sheet-head">
+      <div>Принты <span class="muted">размеры — реальные, в мм</span></div>
+      <button id="btnCloseSheet">✕</button>
+    </div>
+    <div class="sheet-grid" id="catalog"></div>
+  </div>
+  <div class="scrim hidden" id="scrim"></div>
+
+  <!-- Экран успеха / просмотра -->
+  <div class="overlay hidden" id="overlay"></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

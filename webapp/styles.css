@@ -1,0 +1,155 @@
+/* AMANG custom station.
+   Мир предмета: чёрная футболка, термопресс, техкарта в миллиметрах.
+   Акцент — «нагрев» (оранжевый). Цифры и спеки — моноширинным. */
+
+:root {
+  --bg: #111214;
+  --surface: #1a1c1f;
+  --line: #2c2f33;
+  --text: #f2efe9;
+  --muted: #8a8f96;
+  --heat: #ff5a1f;        /* акцент: температура пресса */
+  --ok: #3ddc84;
+  --danger: #ff4d4d;
+  --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 15px/1.45 -apple-system, "Inter", system-ui, sans-serif;
+  overflow: hidden; touch-action: none; overscroll-behavior: none;
+}
+#app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); font-size: 12px; }
+
+.top {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 12px 16px 8px;
+}
+.brand { font-weight: 800; letter-spacing: .12em; }
+.brand span { font-weight: 400; letter-spacing: .02em; color: var(--muted); font-size: 12px; margin-left: 6px; }
+.quota { font-family: var(--mono); font-size: 12px; color: var(--heat); }
+
+.controls { padding: 0 16px 6px; display: flex; flex-direction: column; gap: 8px; }
+.sizes { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.size-chip {
+  border: 1px solid var(--line); background: var(--surface); color: var(--text);
+  border-radius: 8px; padding: 6px 12px; font-family: var(--mono); font-size: 13px;
+  flex: 0 0 auto; cursor: pointer;
+}
+.size-chip small { display: block; font-size: 9px; color: var(--muted); }
+.size-chip.active { border-color: var(--heat); color: var(--heat); }
+.size-chip:disabled { opacity: .35; }
+
+.side-tabs { display: flex; gap: 6px; }
+.side-tab {
+  flex: 1; padding: 7px; border-radius: 8px; border: 1px solid var(--line);
+  background: transparent; color: var(--muted); font-size: 13px; cursor: pointer;
+}
+.side-tab.active { background: var(--surface); color: var(--text); border-color: var(--text); }
+.side-tab .dot { color: var(--heat); }
+
+.stage-wrap { flex: 1; position: relative; display: flex; flex-direction: column; min-height: 0; }
+.stage { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
+.shirt { position: relative; }
+#shirt-svg { display: block; }
+
+/* Печатная зона — техкарта: рамка, центральная ось, мм-риски */
+.zone {
+  position: absolute; border: 1px dashed rgba(255,255,255,.28);
+  background:
+    repeating-linear-gradient(to right, rgba(255,255,255,.10) 0 1px, transparent 1px 100%) ,
+    repeating-linear-gradient(to bottom, rgba(255,255,255,.10) 0 1px, transparent 1px 100%);
+  background-size: var(--tick,20px) 6px, 6px var(--tick,20px);
+  background-position: 0 0, 0 0;
+  background-repeat: repeat-x, repeat-y;
+}
+.zone-center {
+  position: absolute; left: 50%; top: 0; bottom: 0; width: 0;
+  border-left: 1px dashed rgba(255,90,31,.45);
+}
+
+.sticker {
+  position: absolute; touch-action: none; cursor: grab; user-select: none;
+}
+.sticker img { width: 100%; height: 100%; display: block; pointer-events: none; }
+.sticker.selected { outline: 1.5px solid var(--heat); outline-offset: 2px; }
+.sticker.overlap { outline: 1.5px solid var(--danger); outline-offset: 2px; }
+.sticker .dim {
+  position: absolute; left: 50%; bottom: -16px; transform: translateX(-50%);
+  font-family: var(--mono); font-size: 9px; color: var(--muted); white-space: nowrap;
+}
+.sticker.selected .dim { color: var(--heat); }
+
+.sel-tools {
+  position: absolute; bottom: 34px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 8px;
+}
+.sel-tools button {
+  background: var(--surface); border: 1px solid var(--line); color: var(--text);
+  border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+}
+.hint {
+  text-align: center; color: var(--muted); font-size: 12px; padding: 4px 24px 8px;
+}
+.hint.warn { color: var(--danger); }
+
+.bottom {
+  display: flex; gap: 8px; align-items: center; padding: 10px 16px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line); background: var(--bg);
+}
+.catalog-btn {
+  background: var(--surface); color: var(--text); border: 1px solid var(--line);
+  border-radius: 10px; padding: 12px 16px; font-size: 14px; cursor: pointer;
+}
+.price { flex: 1; text-align: center; font-family: var(--mono); font-size: 14px; }
+.price small { display: block; font-size: 10px; color: var(--muted); font-family: inherit; }
+.order-btn {
+  background: var(--heat); color: #16130f; border: 0; border-radius: 10px;
+  padding: 12px 20px; font-size: 14px; font-weight: 700; cursor: pointer;
+}
+.order-btn:disabled { opacity: .35; }
+
+/* Каталог */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 8; }
+.sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 9;
+  background: var(--surface); border-radius: 16px 16px 0 0;
+  max-height: 62vh; display: flex; flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+.sheet-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 16px; font-weight: 600;
+}
+.sheet-head .muted { font-weight: 400; margin-left: 8px; }
+.sheet-head button { background: none; border: 0; color: var(--muted); font-size: 16px; cursor: pointer; }
+.sheet-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  padding: 0 16px 24px; overflow-y: auto; touch-action: pan-y;
+}
+.cat-item {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 8px; text-align: center; cursor: pointer;
+}
+.cat-item img { width: 100%; height: 72px; object-fit: contain; }
+.cat-item .nm { font-size: 12px; margin-top: 6px; }
+.cat-item .sz { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+.cat-item .st { font-family: var(--mono); font-size: 10px; color: var(--heat); }
+.cat-item.out { opacity: .35; pointer-events: none; }
+
+/* Оверлеи: успех / просмотр заказа */
+.overlay {
+  position: fixed; inset: 0; z-index: 20; background: var(--bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 32px; text-align: center; gap: 12px; overflow-y: auto;
+}
+.overlay h2 { font-size: 22px; }
+.overlay .num { font-family: var(--mono); font-size: 40px; color: var(--heat); }
+.overlay p { color: var(--muted); max-width: 320px; }
+.overlay .spec { text-align: left; font-family: var(--mono); font-size: 12px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; max-width: 100%; }
