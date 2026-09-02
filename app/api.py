@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from . import auth, bot as tgbot, config, db, payments
 
 log = logging.getLogger("api")
-app = FastAPI(title="AMANG custom station")
+app = FastAPI(title=f"{config.BRAND} custom station")
 
 
 def require_user(init_data: str | None) -> dict:
@@ -25,6 +25,7 @@ def require_user(init_data: str | None) -> dict:
 @app.get("/api/config")
 def get_config():
     return {
+        "brand": config.BRAND,
         "sizes": {
             s: {**geo, "stock": config.SHIRT_STOCK.get(s, 0)}
             for s, geo in config.SIZES.items()
@@ -36,6 +37,7 @@ def get_config():
         "quota_left": db.quota_left(),
         "pickup_text": config.PICKUP_TEXT,
         "pickup_hold_days": config.PICKUP_HOLD_DAYS,
+        "online_payment": payments.enabled(),
     }
 
 
@@ -98,21 +100,39 @@ async def create_order(body: NewOrder,
         raise HTTPException(400, f"Размер {body.size} закончился")
     if len(body.items) > config.MAX_PRINTS:
         raise HTTPException(400, f"Максимум {config.MAX_PRINTS} принтов")
+
+    phone = db.get_phone(user["id"])
+    # Чек по 54-ФЗ без контакта покупателя пробить нельзя.
+    if payments.enabled() and config.YOOKASSA_SEND_RECEIPT and not phone:
+        asyncio.create_task(tgbot.ask_phone_safe(user["id"]))
+        raise HTTPException(
+            400, "Для чека нужен номер телефона. Открой чат с ботом — там кнопка "
+                 "«Поделиться номером», это один тап. Потом возвращайся и оформи заказ.")
+
     stickers = db.sticker_map({i.sticker_id for i in body.items})
     validate_geometry(body.size, body.items, stickers)
     price = calc_price(len(body.items))
     try:
-        order = db.create_order(user, body.size, [i.model_dump() for i in body.items], price)
+        order = db.create_order(user, body.size,
+                                [i.model_dump() for i in body.items], price, phone)
     except db.OrderError as e:
         raise HTTPException(409, str(e))
+
+    pay_url = None
     try:
-        pay_url = payments.create_payment_url(order)
+        created = await payments.create_payment(order)
+        if created:
+            pay_url, payment_id = created
+            db.set_payment_id(order["id"], payment_id)
+            order["payment_id"] = payment_id
     except payments.PaymentError as e:
-        log.error("payment: %s", e)
-        pay_url = None
+        # Не роняем заказ: сотрудник сможет принять оплату руками.
+        log.error("Не удалось создать платёж по заказу №%s: %s", order["id"], e)
+
     # уведомления не должны валить создание заказа
     asyncio.create_task(_notify_safe(order, pay_url))
-    return {"order_id": order["id"], "price": price, "pay_url": pay_url}
+    return {"order_id": order["id"], "price": price, "pay_url": pay_url,
+            "hold_minutes": config.ORDER_HOLD_MINUTES if pay_url else 0}
 
 
 async def _notify_safe(order: dict, pay_url: str | None):
@@ -135,19 +155,52 @@ def view_order(oid: int, key: str):
     return o
 
 
-@app.post("/api/payments/ypmn/webhook")
-async def ypmn_webhook(request: Request):
-    body = await request.body()
-    oid = payments.verify_webhook(dict(request.headers), body)
-    if oid is None:
-        raise HTTPException(400, "bad signature")
-    o = db.get_order(oid)
-    if o and o["status"] == "new":
-        db.set_status(oid, "paid")
-        o = db.get_order(oid)
-        await tgbot.bot.send_message(
-            o["user_id"], f"Оплата получена ✅ Заказ №{oid} в очереди на запечатку.")
-        await tgbot.notify_staff_new_order(o)
+@app.post("/api/payments/yookassa/webhook")
+async def yookassa_webhook(request: Request):
+    """Уведомление от ЮKassa.
+
+    Телу не доверяем: берём из него id платежа и сами спрашиваем у ЮKassa,
+    что с ним на самом деле. Отвечаем 200 всегда, когда разобрали запрос —
+    иначе ЮKassa будет долбить повторами.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "bad json")
+
+    oid, payment_id = payments.order_id_from_webhook(body)
+    if not payment_id:
+        raise HTTPException(400, "no payment id")
+
+    order = db.get_order(oid) if oid else None
+    if not order:
+        log.warning("Вебхук по неизвестному заказу: %s (платёж %s)", oid, payment_id)
+        return {"ok": True}
+
+    try:
+        confirmed = await payments.confirm_payment(payment_id, order)
+    except payments.PaymentError as e:
+        log.error("Не удалось проверить платёж %s: %s", payment_id, e)
+        raise HTTPException(503, "cannot verify")
+
+    if not confirmed:
+        return {"ok": True}
+
+    if order["status"] == "cancelled":
+        # Деньги пришли по заказу, который мы уже отменили по таймауту.
+        # Молча съесть такое нельзя — зовём сотрудника.
+        await tgbot.alert_staff(
+            f"⚠️ Оплата {order['price']} ₽ пришла по отменённому заказу №{order['id']}.\n"
+            f"Платёж {payment_id}. Нужно вернуть деньги или собрать заказ вручную.")
+        return {"ok": True}
+
+    if not db.mark_paid(order["id"], payment_id):
+        # Уже отмечен оплаченным — это повторная доставка того же уведомления.
+        return {"ok": True}
+
+    order = db.get_order(order["id"])
+    await tgbot.notify_customer_status(order, "paid")
+    await tgbot.refresh_or_send_staff_card(order)
     return {"ok": True}
 
 

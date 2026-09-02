@@ -1,16 +1,23 @@
 """SQLite. При 8–10 заказах в день этого хватает с запасом."""
+import logging
 import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import date
+from datetime import datetime, timedelta, timezone
 
 from . import config
 
-SCHEMA = """
+log = logging.getLogger("db")
+
+# Время заведения (Москва по умолчанию). SQLite считает datetime('now') в UTC,
+# поэтому везде добавляем смещение — иначе дневная квота сбрасывалась бы в 03:00.
+NOW_SQL = f"datetime('now','+{config.TZ_OFFSET_HOURS} hours')"
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS stickers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    file TEXT NOT NULL,          -- имя PNG в data/stickers/
+    file TEXT NOT NULL,          -- имя PNG в stickers/
     width_mm REAL NOT NULL,      -- физический размер DTF-переноса
     height_mm REAL NOT NULL,
     stock INTEGER NOT NULL DEFAULT 0,
@@ -23,13 +30,15 @@ CREATE TABLE IF NOT EXISTS orders (
     user_id INTEGER NOT NULL,
     username TEXT,
     first_name TEXT,
+    phone TEXT,                  -- телефон покупателя (нужен для чека по 54-ФЗ)
     size TEXT NOT NULL,
     price INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'new',
     -- new → paid → in_progress → ready → done | cancelled
+    payment_id TEXT,             -- id платежа в ЮKassa
     view_token TEXT NOT NULL,    -- для просмотра раскладки сотрудником по ссылке
     staff_msg_id INTEGER,        -- id карточки в чате сотрудников
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT ({NOW_SQL})
 );
 CREATE TABLE IF NOT EXISTS order_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,6 +48,11 @@ CREATE TABLE IF NOT EXISTS order_items (
     x_mm REAL NOT NULL,          -- центр стикера: смещение от вертикальной оси (+ вправо)
     y_mm REAL NOT NULL,          -- центр стикера: от верха печатной зоны
     rotation INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS customers (
+    user_id INTEGER PRIMARY KEY,
+    phone TEXT,
+    updated_at TEXT NOT NULL DEFAULT ({NOW_SQL})
 );
 """
 
@@ -55,11 +69,33 @@ def conn():
         c.close()
 
 
+def now_local() -> datetime:
+    """Текущее время заведения (наивный datetime, как в базе)."""
+    return (datetime.now(timezone.utc)
+            + timedelta(hours=config.TZ_OFFSET_HOURS)).replace(tzinfo=None)
+
+
 def init_db():
-    config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Переезд со старого имени базы (amang.db → omanko.db) без потери заказов.
+    if config.LEGACY_DB_PATH.exists() and not config.DB_PATH.exists():
+        config.LEGACY_DB_PATH.rename(config.DB_PATH)
+        log.info("База переименована: %s → %s",
+                 config.LEGACY_DB_PATH.name, config.DB_PATH.name)
     with conn() as c:
         c.executescript(SCHEMA)
+    _migrate()
     sync_stickers_from_csv()
+
+
+def _migrate():
+    """Добавляет колонки, которых нет в уже развёрнутой базе."""
+    with conn() as c:
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(orders)")}
+        for name, ddl in (("phone", "TEXT"), ("payment_id", "TEXT")):
+            if name not in cols:
+                c.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
+                log.info("Миграция: добавлена колонка orders.%s", name)
 
 
 def sync_stickers_from_csv():
@@ -70,11 +106,10 @@ def sync_stickers_from_csv():
     Убрал строку из таблицы → принт прячется из каталога.
     """
     import csv
-    import logging
 
-    log = logging.getLogger("stickers")
+    slog = logging.getLogger("stickers")
     if not config.STICKERS_CSV.exists():
-        log.warning("Нет файла %s — каталог принтов пуст", config.STICKERS_CSV)
+        slog.warning("Нет файла %s — каталог принтов пуст", config.STICKERS_CSV)
         return
     seen = []
     with conn() as c, open(config.STICKERS_CSV, newline="", encoding="utf-8-sig") as f:
@@ -83,14 +118,14 @@ def sync_stickers_from_csv():
             if not row.get("file"):
                 continue
             if not (config.STICKERS_DIR / row["file"]).exists():
-                log.warning("В таблице есть %s, но картинки нет — строка пропущена", row["file"])
+                slog.warning("В таблице есть %s, но картинки нет — строка пропущена", row["file"])
                 continue
             try:
                 name = row["name"]
                 w, h = float(row["width_mm"]), float(row["height_mm"])
                 stock = int(row["stock"])
             except (KeyError, ValueError):
-                log.warning("Строка %s заполнена неверно — пропущена", row.get("file"))
+                slog.warning("Строка %s заполнена неверно — пропущена", row.get("file"))
                 continue
             seen.append(row["file"])
             old = c.execute(
@@ -113,7 +148,7 @@ def sync_stickers_from_csv():
         if seen:
             q = ",".join("?" * len(seen))
             c.execute(f"UPDATE stickers SET active=0 WHERE file NOT IN ({q})", seen)
-    log.info("Каталог принтов обновлён: %d шт.", len(seen))
+    slog.info("Каталог принтов обновлён: %d шт.", len(seen))
 
 
 # ---------- Стикеры ----------
@@ -133,13 +168,30 @@ def sticker_map(ids):
     return {r["id"]: dict(r) for r in rows}
 
 
+# ---------- Покупатели ----------
+
+def set_phone(user_id: int, phone: str):
+    with conn() as c:
+        c.execute(
+            f"INSERT INTO customers (user_id, phone, updated_at) VALUES (?,?,{NOW_SQL}) "
+            f"ON CONFLICT(user_id) DO UPDATE SET phone=excluded.phone, updated_at={NOW_SQL}",
+            (user_id, phone),
+        )
+
+
+def get_phone(user_id: int) -> str | None:
+    with conn() as c:
+        row = c.execute("SELECT phone FROM customers WHERE user_id=?", (user_id,)).fetchone()
+    return row["phone"] if row else None
+
+
 # ---------- Квота ----------
 
 def orders_today() -> int:
     with conn() as c:
         row = c.execute(
-            "SELECT COUNT(*) n FROM orders WHERE date(created_at)=? AND status!='cancelled'",
-            (date.today().isoformat(),),
+            "SELECT COUNT(*) n FROM orders "
+            f"WHERE date(created_at)=date({NOW_SQL}) AND status!='cancelled'"
         ).fetchone()
     return row["n"]
 
@@ -154,15 +206,15 @@ class OrderError(Exception):
     pass
 
 
-def create_order(user, size: str, items: list, price: int) -> dict:
+def create_order(user, size: str, items: list, price: int, phone: str | None = None) -> dict:
     """items: [{side, sticker_id, x_mm, y_mm, rotation}, ...]
     Резервирует остатки стикеров атомарно."""
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
         # квота
         n = c.execute(
-            "SELECT COUNT(*) n FROM orders WHERE date(created_at)=? AND status!='cancelled'",
-            (date.today().isoformat(),),
+            "SELECT COUNT(*) n FROM orders "
+            f"WHERE date(created_at)=date({NOW_SQL}) AND status!='cancelled'"
         ).fetchone()["n"]
         if n >= config.ONLINE_QUOTA_PER_DAY:
             raise OrderError("Квота онлайн-заказов на сегодня исчерпана. Попробуй завтра!")
@@ -180,10 +232,10 @@ def create_order(user, size: str, items: list, price: int) -> dict:
         for sid, cnt in need.items():
             c.execute("UPDATE stickers SET stock=stock-? WHERE id=?", (cnt, sid))
         cur = c.execute(
-            "INSERT INTO orders (user_id, username, first_name, size, price, view_token) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO orders (user_id, username, first_name, phone, size, price, view_token) "
+            "VALUES (?,?,?,?,?,?,?)",
             (user["id"], user.get("username"), user.get("first_name"),
-             size, price, secrets.token_urlsafe(8)),
+             phone, size, price, secrets.token_urlsafe(8)),
         )
         oid = cur.lastrowid
         for it in items:
@@ -215,12 +267,57 @@ def set_status(oid: int, status: str, restock: bool = False):
     with conn() as c:
         c.execute("UPDATE orders SET status=? WHERE id=?", (status, oid))
         if restock:
-            for row in c.execute(
-                "SELECT sticker_id, COUNT(*) n FROM order_items WHERE order_id=? GROUP BY sticker_id",
-                (oid,),
-            ).fetchall():
-                c.execute("UPDATE stickers SET stock=stock+? WHERE id=?",
-                          (row["n"], row["sticker_id"]))
+            _restock(c, oid)
+
+
+def _restock(c, oid: int):
+    for row in c.execute(
+        "SELECT sticker_id, COUNT(*) n FROM order_items WHERE order_id=? GROUP BY sticker_id",
+        (oid,),
+    ).fetchall():
+        c.execute("UPDATE stickers SET stock=stock+? WHERE id=?",
+                  (row["n"], row["sticker_id"]))
+
+
+def set_payment_id(oid: int, payment_id: str):
+    with conn() as c:
+        c.execute("UPDATE orders SET payment_id=? WHERE id=?", (payment_id, oid))
+
+
+def mark_paid(oid: int, payment_id: str | None = None) -> bool:
+    """Переводит заказ в paid. Возвращает False, если он уже не 'new' —
+    так повторная доставка вебхука не создаёт второе уведомление клиенту."""
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute(
+            "UPDATE orders SET status='paid', payment_id=COALESCE(?, payment_id) "
+            "WHERE id=? AND status='new'",
+            (payment_id, oid),
+        )
+        return cur.rowcount == 1
+
+
+def cancel_if_new(oid: int) -> bool:
+    """Отменяет заказ и возвращает принты в остатки, если он всё ещё не оплачен."""
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute(
+            "UPDATE orders SET status='cancelled' WHERE id=? AND status='new'", (oid,)
+        )
+        if cur.rowcount != 1:
+            return False
+        _restock(c, oid)
+        return True
+
+
+def expired_unpaid(minutes: int) -> list[dict]:
+    """Заказы, которые висят в 'new' дольше положенного."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, user_id, price, payment_id, staff_msg_id FROM orders "
+            f"WHERE status='new' AND created_at < datetime({NOW_SQL},'-{int(minutes)} minutes')"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def set_staff_msg(oid: int, msg_id: int):
