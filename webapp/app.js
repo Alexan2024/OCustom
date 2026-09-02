@@ -1,4 +1,4 @@
-/* AMANG custom station — редактор в реальном масштабе.
+/* ÖMANKÖ custom station — редактор в реальном масштабе.
    Координаты хранятся в мм: x — смещение центра стикера от вертикальной оси зоны
    (+ вправо), y — от верхнего края зоны до центра стикера. */
 
@@ -271,6 +271,9 @@ async function submitOrder() {
     return;
   }
   haptic("heavy");
+  const hold = data.hold_minutes
+    ? `<br><br>Ссылка ждёт ${data.hold_minutes} минут — потом принты вернутся в каталог.`
+    : "";
   const ov = $("overlay");
   ov.classList.remove("hidden");
   ov.innerHTML = `
@@ -278,9 +281,9 @@ async function submitOrder() {
     <div class="num">№${data.order_id}</div>
     <p>Сумма ${data.price} ₽. ${data.pay_url
       ? "Ссылка на оплату — в чате с ботом."
-      : "Реквизиты для оплаты придут в чат с ботом."}<br><br>
+      : "Реквизиты для оплаты придут в чат с ботом."}${hold}<br><br>
     После оплаты возьмём в работу и напишем, когда будет готово.</p>`;
-  setTimeout(() => tg?.close?.(), data.pay_url ? 1200 : 2600);
+  setTimeout(() => tg?.close?.(), data.pay_url ? 1800 : 2600);
 }
 
 /* ---------- События ---------- */
