@@ -75,6 +75,11 @@ def now_local() -> datetime:
             + timedelta(hours=config.TZ_OFFSET_HOURS)).replace(tzinfo=None)
 
 
+def stamp(dt: datetime) -> str:
+    """Время в том же формате, в котором его пишет SQLite."""
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def init_db():
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     # Переезд со старого имени базы (amang.db → omanko.db) без потери заказов.
@@ -96,6 +101,34 @@ def _migrate():
             if name not in cols:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
                 log.info("Миграция: добавлена колонка orders.%s", name)
+        _fix_legacy_created_at(c)
+
+
+def _fix_legacy_created_at(c):
+    """Разовая починка времени заказов.
+
+    В первой версии схемы created_at писался в UTC. Сравнения идут по времени
+    заведения (UTC+TZ_OFFSET_HOURS), поэтому свежий заказ выглядел на три часа
+    старше, чем есть, и автоотмена срабатывала сразу после создания. Уже
+    существующую таблицу CREATE TABLE IF NOT EXISTS не переписывает, так что
+    старый дефолт живёт в базе до тех пор, пока его не поправить руками.
+
+    Метку о том, что починка сделана, держим в PRAGMA user_version — второй раз
+    время не сдвинется.
+    """
+    if c.execute("PRAGMA user_version").fetchone()[0] >= 1:
+        return
+    row = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+    ).fetchone()
+    ddl = (row["sql"] if row else "") or ""
+    if "hours" not in ddl and config.TZ_OFFSET_HOURS:
+        n = c.execute(
+            f"UPDATE orders SET created_at="
+            f"datetime(created_at,'+{int(config.TZ_OFFSET_HOURS)} hours')"
+        ).rowcount
+        log.info("Миграция: время у %d заказов переведено из UTC в местное", n)
+    c.execute("PRAGMA user_version = 1")
 
 
 def sync_stickers_from_csv():
@@ -191,7 +224,8 @@ def orders_today() -> int:
     with conn() as c:
         row = c.execute(
             "SELECT COUNT(*) n FROM orders "
-            f"WHERE date(created_at)=date({NOW_SQL}) AND status!='cancelled'"
+            "WHERE date(created_at)=? AND status!='cancelled'",
+            (now_local().strftime("%Y-%m-%d"),),
         ).fetchone()
     return row["n"]
 
@@ -209,12 +243,13 @@ class OrderError(Exception):
 def create_order(user, size: str, items: list, price: int, phone: str | None = None) -> dict:
     """items: [{side, sticker_id, x_mm, y_mm, rotation}, ...]
     Резервирует остатки стикеров атомарно."""
+    today = now_local().strftime("%Y-%m-%d")
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
         # квота
         n = c.execute(
             "SELECT COUNT(*) n FROM orders "
-            f"WHERE date(created_at)=date({NOW_SQL}) AND status!='cancelled'"
+            "WHERE date(created_at)=? AND status!='cancelled'", (today,)
         ).fetchone()["n"]
         if n >= config.ONLINE_QUOTA_PER_DAY:
             raise OrderError("Квота онлайн-заказов на сегодня исчерпана. Попробуй завтра!")
@@ -231,11 +266,13 @@ def create_order(user, size: str, items: list, price: int, phone: str | None = N
                 raise OrderError(f"Принт «{nm}» уже разобрали. Убери его или выбери другой.")
         for sid, cnt in need.items():
             c.execute("UPDATE stickers SET stock=stock-? WHERE id=?", (cnt, sid))
+        # Время пишем сами, а не дефолтом таблицы: в старых базах дефолт остался
+        # в UTC, и заказ рождался «на три часа старше», чем есть.
         cur = c.execute(
-            "INSERT INTO orders (user_id, username, first_name, phone, size, price, view_token) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO orders (user_id, username, first_name, phone, size, price,"
+            " view_token, created_at) VALUES (?,?,?,?,?,?,?,?)",
             (user["id"], user.get("username"), user.get("first_name"),
-             phone, size, price, secrets.token_urlsafe(8)),
+             phone, size, price, secrets.token_urlsafe(8), stamp(now_local())),
         )
         oid = cur.lastrowid
         for it in items:
@@ -311,11 +348,19 @@ def cancel_if_new(oid: int) -> bool:
 
 
 def expired_unpaid(minutes: int) -> list[dict]:
-    """Заказы, которые висят в 'new' дольше положенного."""
+    """Заказы, которые висят в 'new' дольше положенного.
+
+    Границу считаем в Python и сравниваем с created_at, который тоже пишется
+    из Python: обе стороны заведомо в одной системе отсчёта. Раньше время
+    заказа приходило из дефолта таблицы (в старых базах — UTC), а граница
+    считалась в местном времени, и разница в три часа отменяла заказ
+    через секунду после создания.
+    """
+    cutoff = stamp(now_local() - timedelta(minutes=int(minutes)))
     with conn() as c:
         rows = c.execute(
             "SELECT id, user_id, price, payment_id, staff_msg_id FROM orders "
-            f"WHERE status='new' AND created_at < datetime({NOW_SQL},'-{int(minutes)} minutes')"
+            "WHERE status='new' AND created_at < ?", (cutoff,)
         ).fetchall()
     return [dict(r) for r in rows]
 
