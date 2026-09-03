@@ -3,11 +3,15 @@
    Координаты хранятся в мм: x — смещение центра стикера от вертикальной оси
    зоны (+ вправо), y — от верхнего края зоны до центра стикера.
    На рукаве та же пара означает другое: x идёт вокруг руки (+ к спине),
-   y — вниз от проймы. Сторон четыре: front, back, sleeve_l, sleeve_r.
-   Левый и правый — как на человеке. */
+   y — вниз от проймы. Сторон четыре: front, back, sleeve_l, sleeve_r. */
 
 const tg = window.Telegram?.WebApp;
 tg?.ready(); tg?.expand();
+/* Свайп вниз внутри мини-аппа Telegram сворачивает окно. При перетаскивании
+   принта вниз срабатывал именно он, а не перетаскивание. Метод есть
+   с Bot API 7.7; на клиентах постарее его нет — там работает страховка
+   с touchmove ниже. */
+tg?.disableVerticalSwipes?.();
 
 const $ = (id) => document.getElementById(id);
 const SLEEVES = ["sleeve_l", "sleeve_r"];
@@ -131,8 +135,14 @@ function layoutRefresh() { layout(); renderAll(); }
 function layoutBody(availW, availH) {
   const ph = state.cfg.photo;
   const aspect = ph.w_px / ph.h_px;
-  const shirtW = Math.min(availW, availH * aspect);
-  const shirtH = shirtW / aspect;
+  // Снимок можно растянуть по вертикали (PHOTO_STRETCH_Y в config.py): фото —
+  // сток-мокап, сжатый до реальных пропорций бланка, и без растяжки футболка
+  // выглядит приплюснутой. Миллиметры от этого не едут: масштаб берётся
+  // от ширины по груди, а верх зоны привязан к линии плеча, доля которой
+  // в высоте снимка не меняется.
+  const k = ph.stretch_y || 1;
+  const shirtW = Math.min(availW, availH * aspect / k);
+  const shirtH = shirtW / aspect * k;
 
   // Масштаб берём от ширины по груди: на фото это chest_x0..chest_x1,
   // в жизни — число B из размерной сетки.
@@ -288,6 +298,7 @@ function attachDrag(el, p) {
     if (state.target !== p.side) { state.target = p.side; layoutRefresh(); return; }
     refreshFlags();
     startX = e.clientX; startY = e.clientY; sx = p.x_mm; sy = p.y_mm;
+    document.body.classList.add("dragging");
   });
   el.addEventListener("pointermove", (e) => {
     if (startX == null) return;
@@ -303,7 +314,7 @@ function attachDrag(el, p) {
     el.style.top = p.y_mm * state.ppm + "px";
     refreshFlags();
   });
-  const end = () => { startX = null; };
+  const end = () => { startX = null; document.body.classList.remove("dragging"); };
   el.addEventListener("pointerup", end);
   el.addEventListener("pointercancel", end);
 }
@@ -438,5 +449,12 @@ $("btnDelete").onclick = () => {
 };
 $("btnOrder").onclick = submitOrder;
 window.addEventListener("resize", () => { layout(); renderAll(); });
+
+/* Пока тащим принт, страница не должна прокручиваться: именно эта прокрутка
+   на телефоне и превращается в жест «свернуть мини-апп». Каталога не касается —
+   класс висит только во время перетаскивания. */
+document.addEventListener("touchmove", (e) => {
+  if (document.body.classList.contains("dragging")) e.preventDefault();
+}, { passive: false });
 
 boot();
