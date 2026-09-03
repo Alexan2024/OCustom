@@ -31,7 +31,7 @@ def get_config():
                 "zones": config.zones(s)}
             for s, geo in config.SIZES.items()
         },
-        "photo": config.SHIRT_PHOTO,
+        "photo": {**config.SHIRT_PHOTO, "stretch_y": config.PHOTO_STRETCH_Y},
         "min_gap_mm": config.MIN_GAP_MM,
         "base_price": config.BASE_PRICE,
         "included_prints": config.INCLUDED_PRINTS,
