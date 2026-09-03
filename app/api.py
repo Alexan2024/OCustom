@@ -27,9 +27,12 @@ def get_config():
     return {
         "brand": config.BRAND,
         "sizes": {
-            s: {**geo, "stock": config.SHIRT_STOCK.get(s, 0)}
+            s: {**geo, "stock": config.SHIRT_STOCK.get(s, 0),
+                "zones": config.zones(s)}
             for s, geo in config.SIZES.items()
         },
+        "photo": config.SHIRT_PHOTO,
+        "min_gap_mm": config.MIN_GAP_MM,
         "base_price": config.BASE_PRICE,
         "included_prints": config.INCLUDED_PRINTS,
         "extra_print_price": config.EXTRA_PRINT_PRICE,
@@ -47,7 +50,7 @@ def get_stickers():
 
 
 class Item(BaseModel):
-    side: str = Field(pattern="^(front|back)$")
+    side: str = Field(pattern="^(front|back|sleeve_l|sleeve_r)$")
     sticker_id: int
     x_mm: float
     y_mm: float
@@ -65,28 +68,39 @@ def calc_price(n_items: int) -> int:
 
 
 def validate_geometry(size: str, items: list[Item], stickers: dict):
-    geo = config.SIZES[size]
-    boxes = {"front": [], "back": []}
+    """Каждый принт должен лежать в своей зоне и не подходить к соседу
+    ближе, чем на MIN_GAP_MM: пресс жмёт наклейки по одной, и край платена
+    не должен накрыть уже запечатанный принт."""
+    boxes: dict[str, list] = {s: [] for s in config.SIDES}
+    gap = config.MIN_GAP_MM
     for it in items:
         s = stickers.get(it.sticker_id)
         if not s:
             raise HTTPException(400, f"Стикер {it.sticker_id} не найден")
+        z = config.zone(size, it.side)
         w, h = s["width_mm"], s["height_mm"]
         if it.rotation not in (0, 90, 180, 270):
             raise HTTPException(400, "Поворот только 0/90/180/270")
         if it.rotation in (90, 270):
             w, h = h, w
+        if w > z["w_mm"] + 0.5 or h > z["h_mm"] + 0.5:
+            raise HTTPException(
+                400, f"«{s['name']}» не помещается в зону "
+                     f"({z['w_mm']:.0f}×{z['h_mm']:.0f} мм)")
         half_w, half_h = w / 2, h / 2
         # внутри печатной зоны
-        if (abs(it.x_mm) + half_w > geo["print_w_mm"] / 2 + 0.5
+        if (abs(it.x_mm) + half_w > z["w_mm"] / 2 + 0.5
                 or it.y_mm - half_h < -0.5
-                or it.y_mm + half_h > geo["print_h_mm"] + 0.5):
+                or it.y_mm + half_h > z["h_mm"] + 0.5):
             raise HTTPException(400, f"«{s['name']}» выходит за печатную зону")
-        # без пересечений (наложение = дольше запечатка, запрещено)
+        # просвет до соседей на той же стороне
         box = (it.x_mm - half_w, it.y_mm - half_h, it.x_mm + half_w, it.y_mm + half_h)
         for b in boxes[it.side]:
-            if box[0] < b[2] and box[2] > b[0] and box[1] < b[3] and box[3] > b[1]:
-                raise HTTPException(400, "Принты не должны пересекаться")
+            if (box[0] < b[2] + gap and box[2] > b[0] - gap
+                    and box[1] < b[3] + gap and box[3] > b[1] - gap):
+                raise HTTPException(
+                    400, f"Между принтами нужно хотя бы {gap} мм — иначе пресс "
+                         "заденет соседний")
         boxes[it.side].append(box)
 
 
