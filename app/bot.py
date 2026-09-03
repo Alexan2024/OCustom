@@ -23,6 +23,15 @@ STATUS_LABELS = {
     "cancelled": "❌ Отменён",
 }
 
+# Заголовки сторон в карточке. Левый/правый — как на человеке, а не как
+# на экране: сотрудник берёт вещь в руки, ему нужна эта система координат.
+SIDE_TITLES = {
+    "front": "ПЕРЕД",
+    "back": "СПИНА",
+    "sleeve_l": "ЛЕВЫЙ РУКАВ (как на человеке)",
+    "sleeve_r": "ПРАВЫЙ РУКАВ (как на человеке)",
+}
+
 # Переходы, доступные сотруднику из каждого статуса
 STAFF_FLOW = {
     "new": [("paid", "Оплачен ✓"), ("cancelled", "Отменить ✕")],
@@ -117,7 +126,8 @@ async def start(m: Message):
     await m.answer(
         f"Привет! Это кастом-станция {config.BRAND}.\n\n"
         "Собери свою футболку: выбери принты, расставь их как хочешь — "
-        "мы запечатаем, а ты просто заберёшь готовую.\n\n"
+        "на груди, на спине и на рукавах. Мы запечатаем, а ты просто "
+        "заберёшь готовую.\n\n"
         f"📍 {config.PICKUP_TEXT}\n"
         f"⚡ {quota_line}\n"
         f"🕐 Храним готовый заказ {config.PICKUP_HOLD_DAYS} дней.",
@@ -156,6 +166,27 @@ async def got_contact(m: Message):
 
 # ---------- Карточка заказа в чате сотрудников ----------
 
+def _placement_line(item: dict, side: str) -> str:
+    """Одна строка спеки: где именно лежит принт, в миллиметрах."""
+    x, y = item["x_mm"], item["y_mm"]
+    if side in config.SLEEVE_SIDES:
+        # По рукаву ось X идёт вокруг руки: минус — к переду, плюс — к спине.
+        if abs(x) < 0.5:
+            dx = "ровно по центру сбоку"
+        else:
+            dx = f"{abs(x):.0f} мм {'к спине' if x > 0 else 'к переду'} от центра"
+        dy = f"{y:.0f} мм от проймы"
+    else:
+        if abs(x) < 0.5:
+            dx = "по центру"
+        else:
+            dx = f"{abs(x):.0f} мм {'правее' if x > 0 else 'левее'} центра"
+        dy = f"{y:.0f} мм от верха зоны"
+    rot = f", поворот {item['rotation']}°" if item["rotation"] else ""
+    return (f"  • «{item['name']}» ({item['width_mm']:.0f}×{item['height_mm']:.0f} мм): "
+            f"центр {dx}, {dy}{rot}")
+
+
 def order_card_text(o: dict) -> str:
     contact = f"@{o['username']}" if o["username"] else "—"
     lines = [
@@ -168,21 +199,13 @@ def order_card_text(o: dict) -> str:
         f"Размер: {o['size']}  |  Сумма: {o['price']} ₽",
         "",
     ]
-    for side, title in (("front", "ПЕРЕД"), ("back", "СПИНА")):
+    for side in config.SIDES:
         items = [i for i in o["items"] if i["side"] == side]
         if not items:
             continue
-        lines.append(f"— {title} —")
+        lines.append(f"— {SIDE_TITLES[side]} —")
         for i in items:
-            if abs(i["x_mm"]) < 0.5:
-                dx = "по центру"
-            else:
-                dx = f"{abs(i['x_mm']):.0f} мм {'правее' if i['x_mm'] > 0 else 'левее'} центра"
-            rot = f", поворот {i['rotation']}°" if i["rotation"] else ""
-            lines.append(
-                f"  • «{i['name']}» ({i['width_mm']:.0f}×{i['height_mm']:.0f} мм): "
-                f"центр {dx}, {i['y_mm']:.0f} мм от верха зоны{rot}"
-            )
+            lines.append(_placement_line(i, side))
     lines.append("")
     lines.append(f"👁 Раскладка: {config.WEBAPP_URL}/webapp/?view={o['id']}&key={o['view_token']}")
     return "\n".join(lines)
