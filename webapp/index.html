@@ -6,6 +6,7 @@
 <title>ÖMANKÖ — кастом-станция</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="styles.css">
+<link rel="preload" as="image" href="shirt_front.webp">
 </head>
 <body>
 <div id="app">
@@ -17,20 +18,15 @@
   <section class="controls">
     <div class="sizes" id="sizes"></div>
     <div class="side-tabs">
-      <button class="side-tab active" data-side="front">Перед</button>
-      <button class="side-tab" data-side="back">Спина</button>
+      <button class="side-tab active" data-view="front">Перед</button>
+      <button class="side-tab" data-view="back">Спина</button>
+      <button class="side-tab" data-view="sleeves">Рукава</button>
     </div>
   </section>
 
   <section class="stage-wrap">
-    <div class="stage" id="stage">
-      <div class="shirt" id="shirt">
-        <svg id="shirt-svg" preserveAspectRatio="xMidYMid meet"></svg>
-        <div class="zone" id="zone">
-          <div class="zone-center"></div>
-        </div>
-      </div>
-    </div>
+    <!-- Сцену собирает layout(): фото бланка с зоной либо две схемы рукавов -->
+    <div class="stage" id="stage"></div>
     <div class="sel-tools hidden" id="selTools">
       <button id="btnRotate" title="Повернуть">⟳ 90°</button>
       <button id="btnDelete" title="Убрать">✕ убрать</button>
@@ -47,7 +43,7 @@
   <!-- Каталог -->
   <div class="sheet hidden" id="sheet">
     <div class="sheet-head">
-      <div>Принты <span class="muted">размеры — реальные, в мм</span></div>
+      <div>Принты <span class="muted" id="sheetSide"></span></div>
       <button id="btnCloseSheet">✕</button>
     </div>
     <div class="sheet-grid" id="catalog"></div>
