@@ -1,6 +1,7 @@
 """Бот: точка входа для покупателя + рабочее место сотрудника (карточки заказов)."""
 import asyncio
 import logging
+import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -104,6 +105,66 @@ async def chat_id(m: Message):
         "Скопируй его в переменную STAFF_CHAT_ID на Railway.",
         parse_mode="HTML",
     )
+
+
+def _secret_state(value: str) -> str:
+    if not value:
+        return "не задан"
+    return f"задан ({len(value)} симв.)"
+
+
+@dp.message(Command("diag"))
+async def diag(m: Message):
+    """Самопроверка. Работает только в чате сотрудников: показывает, какие
+    настройки доехали и что о нас думают ЮKassa и СДЭК. Значения ключей
+    не печатает — только «задан / не задан»."""
+    if config.STAFF_CHAT_ID and m.chat.id != config.STAFF_CHAT_ID:
+        return
+    lines = [f"🩺 {config.BRAND}, состояние", ""]
+
+    lines.append(f"Режим оплаты: {config.PAYMENT_MODE}")
+    if config.PAYMENT_MODE not in ("manual", "yookassa"):
+        lines.append("  ❌ значение не распознано — ссылки на оплату не создаются")
+    if payments.enabled():
+        lines.append(f"  SHOP_ID: {_secret_state(config.YOOKASSA_SHOP_ID)}")
+        lines.append(f"  SECRET_KEY: {_secret_state(config.YOOKASSA_SECRET_KEY)}")
+        lines.append(f"  Чек 54-ФЗ: "
+                     f"{'передаём' if config.YOOKASSA_SEND_RECEIPT else 'выключен'}")
+        try:
+            shop = await payments.fetch_shop()
+            lines.append(f"  ✅ магазин отвечает, статус «{shop.get('status')}»")
+            fisc = payments.fiscalization_on(shop)
+            if fisc is None:
+                lines.append("  ⚠️ не понял, включена ли фискализация")
+            elif fisc and not config.YOOKASSA_SEND_RECEIPT:
+                lines.append("  ❌ КАССА ПОДКЛЮЧЕНА, а YOOKASSA_SEND_RECEIPT=false.")
+                lines.append("     Поэтому платежи и отклоняются. Поставь "
+                             "YOOKASSA_SEND_RECEIPT=true и YOOKASSA_VAT_CODE.")
+            elif not fisc and config.YOOKASSA_SEND_RECEIPT:
+                lines.append("  ⚠️ чек собираем, но касса не подключена — "
+                             "чеки уходят в никуда")
+            else:
+                lines.append("  ✅ чек и касса согласованы")
+        except payments.PaymentError as e:
+            lines.append(f"  ❌ {e}")
+
+    lines.append("")
+    if cdek.enabled():
+        lines.append("Доставка: СДЭК, "
+                     + ("ПЕСОЧНИЦА" if config.CDEK_TEST else "боевой контур"))
+        lines.append(f"  ACCOUNT: {_secret_state(config.CDEK_ACCOUNT)}")
+        lines.append(f"  PASSWORD: {_secret_state(config.CDEK_PASSWORD)}")
+        try:
+            for s in await cdek.check():
+                lines.append("  " + s)
+        except cdek.CdekError as e:
+            lines.append(f"  ❌ {e}")
+    else:
+        lines.append("Доставка: только самовывоз (DELIVERY_CDEK выключен)")
+
+    lines += ["", f"Мини-апп: {config.WEBAPP_URL}/webapp/",
+              f"Заказов сегодня: {db.orders_today()} из {config.ONLINE_QUOTA_PER_DAY}"]
+    await m.answer("\n".join(lines), disable_web_page_preview=True)
 
 
 @dp.message(CommandStart(deep_link=True))
@@ -273,8 +334,13 @@ def order_card_text(o: dict) -> str:
 def order_card_kb(o: dict) -> InlineKeyboardMarkup | None:
     rows = [[InlineKeyboardButton(text=t, callback_data=f"st:{o['id']}:{s}")]
             for s, t in staff_flow(o).get(o["status"], [])]
-    # Накладную можно перевыпустить руками: СДЭК мог не ответить в момент,
-    # когда заказ переводили в «Готово».
+    # Ссылку на оплату можно перевыпустить: ЮKassa могла не ответить
+    # в момент создания заказа, и человек остался без ссылки.
+    if o["status"] == "new" and payments.enabled():
+        rows.append([InlineKeyboardButton(text="Выслать ссылку на оплату ↻",
+                                          callback_data=f"pay:{o['id']}")])
+    # Накладную тоже можно перевыпустить руками: СДЭК мог не ответить
+    # в момент, когда заказ переводили в «Готово».
     if (o["delivery_method"] != "pickup" and cdek.enabled()
             and not o.get("cdek_uuid") and o["status"] in ("ready", "shipped")):
         rows.append([InlineKeyboardButton(text="Создать накладную СДЭК ↻",
@@ -398,6 +464,40 @@ async def sync_shipment(oid: int):
     await refresh_or_send_staff_card(o)
 
 
+@dp.callback_query(F.data.startswith("pay:"))
+async def staff_resend_link(cb: CallbackQuery):
+    """Перевыпуск ссылки на оплату. Ключ идемпотентности меняем временем —
+    иначе ЮKassa вернёт тот же самый (неудавшийся) платёж."""
+    oid = int(cb.data.split(":", 1)[1])
+    o = db.get_order(oid)
+    if not o:
+        await cb.answer("Заказ не найден", show_alert=True)
+        return
+    if o["status"] != "new":
+        await cb.answer("Заказ уже не ждёт оплаты", show_alert=True)
+        return
+    await cb.answer("Выпускаю ссылку…")
+    try:
+        created = await payments.create_payment(o, attempt=int(time.time()))
+    except payments.PaymentError as e:
+        await alert_staff(f"⚠️ Заказ №{oid}: ссылка снова не выпустилась.\n{e}")
+        return
+    if not created:
+        await alert_staff(f"Заказ №{oid}: включён ручной режим оплаты, "
+                          "ссылку выпускать нечем.")
+        return
+    pay_url, payment_id = created
+    db.set_payment_id(oid, payment_id)
+    try:
+        await bot.send_message(
+            o["user_id"],
+            f"Ссылка на оплату заказа №{oid}, сумма {o['price']} ₽:\n{pay_url}")
+        await alert_staff(f"✅ Заказ №{oid}: ссылка на оплату ушла покупателю.")
+    except Exception as e:
+        await alert_staff(f"⚠️ Заказ №{oid}: ссылка выпущена, но покупателю "
+                          f"не доставилась ({e}). Вот она:\n{pay_url}")
+
+
 @dp.callback_query(F.data.startswith("cd:"))
 async def staff_make_shipment(cb: CallbackQuery):
     oid = int(cb.data.split(":", 1)[1])
@@ -454,6 +554,13 @@ async def notify_customer_order_created(o: dict, pay_url: str | None):
         if config.ORDER_HOLD_MINUTES:
             text += (f"\n\nСсылка ждёт {config.ORDER_HOLD_MINUTES} минут: если не "
                      "оплатить, принты вернутся в каталог.")
+    elif payments.enabled():
+        # Ссылка не выпустилась. Обещать «реквизиты» нельзя — это текст
+        # ручного режима, а сотрудники в этот момент ничего не знают.
+        # Знать они будут: рядом уходит предупреждение в рабочий чат.
+        text = (f"Заказ №{o['id']} создан! Сумма {o['price']} ₽.\n"
+                "Со ссылкой на оплату вышла заминка — уже разбираемся, "
+                "пришлём её сюда в ближайшие минуты.")
     else:
         text = (f"Заказ №{o['id']} создан! Сумма {o['price']} ₽.\n"
                 "Сейчас напишем тебе реквизиты для оплаты. "
