@@ -14,6 +14,8 @@ GET /v3/payments/{id} и сверяем статус и сумму. Поддел
 Про чек (54-ФЗ): состав чека собирается, только если YOOKASSA_SEND_RECEIPT=true.
 Включать в тот же день, когда онлайн-касса будет подключена к ЮKassa: раньше —
 чек уйдёт в никуда, позже — магазин начнёт отклонять платежи без чека.
+Доставка в чеке идёт отдельной строкой как услуга — иначе сумма позиций
+не сойдётся с суммой платежа, и ЮKassa откажет.
 """
 import logging
 import re
@@ -70,6 +72,11 @@ def return_url(oid: int) -> str:
     return f"{config.WEBAPP_URL}/webapp/"
 
 
+def goods_price(order: dict) -> int:
+    """Сумма заказа без доставки."""
+    return int(order["price"]) - int(order.get("delivery_price") or 0)
+
+
 def build_receipt(order: dict) -> dict | None:
     """Состав чека. Позиции обязаны в сумме давать цену заказа."""
     phone = normalize_phone(order.get("phone"))
@@ -95,6 +102,19 @@ def build_receipt(order: dict) -> dict | None:
             "payment_subject": "commodity",
         })
     total = config.BASE_PRICE + extra * config.EXTRA_PRINT_PRICE
+
+    delivery = int(order.get("delivery_price") or 0)
+    if delivery:
+        items.append({
+            "description": "Доставка СДЭК",
+            "quantity": "1.00",
+            "amount": {"value": _rub(delivery), "currency": "RUB"},
+            "vat_code": config.YOOKASSA_VAT_CODE,
+            "payment_mode": "full_payment",
+            "payment_subject": "service",
+        })
+        total += delivery
+
     if total != order["price"]:
         raise PaymentError(
             f"Чек не сходится с заказом: {total} ≠ {order['price']} ₽")
