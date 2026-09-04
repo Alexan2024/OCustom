@@ -37,7 +37,6 @@ def get_config():
         "included_prints": config.INCLUDED_PRINTS,
         "extra_print_price": config.EXTRA_PRINT_PRICE,
         "max_prints": config.MAX_PRINTS,
-        "quota_left": db.quota_left(),
         "pickup_text": config.PICKUP_TEXT,
         "pickup_hold_days": config.PICKUP_HOLD_DAYS,
         "online_payment": payments.enabled(),
@@ -149,7 +148,14 @@ calc_price = calc_goods_price
 def validate_geometry(size: str, items: list[Item], stickers: dict):
     """Каждый принт должен лежать в своей зоне и не подходить к соседу
     ближе, чем на MIN_GAP_MM: пресс жмёт наклейки по одной, и край платена
-    не должен накрыть уже запечатанный принт."""
+    не должен накрыть уже запечатанный принт.
+
+    Поворот свободный, 0..359°. Габарит, по которому считается попадание
+    в зону и просвет до соседа, всегда неповёрнутый — ровно так же считает
+    мини-апп. На промежуточных углах углы принта могут выйти за пунктир:
+    это допущено сознательно, отступы зоны (шов, низ, горловина) такой
+    выход переживают.
+    """
     boxes: dict[str, list] = {s: [] for s in config.SIDES}
     gap = config.MIN_GAP_MM
     for it in items:
@@ -158,10 +164,8 @@ def validate_geometry(size: str, items: list[Item], stickers: dict):
             raise HTTPException(400, f"Стикер {it.sticker_id} не найден")
         z = config.zone(size, it.side)
         w, h = s["width_mm"], s["height_mm"]
-        if it.rotation not in (0, 90, 180, 270):
-            raise HTTPException(400, "Поворот только 0/90/180/270")
-        if it.rotation in (90, 270):
-            w, h = h, w
+        if not 0 <= it.rotation <= 359:
+            raise HTTPException(400, "Поворот должен быть от 0 до 359°")
         if w > z["w_mm"] + 0.5 or h > z["h_mm"] + 0.5:
             raise HTTPException(
                 400, f"«{s['name']}» не помещается в зону "

@@ -5,11 +5,13 @@ import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, KeyboardButton, Message,
-                           ReplyKeyboardMarkup, ReplyKeyboardRemove, WebAppInfo)
+from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats,
+                           BufferedInputFile, CallbackQuery,
+                           InlineKeyboardButton, InlineKeyboardMarkup,
+                           KeyboardButton, Message, ReplyKeyboardMarkup,
+                           ReplyKeyboardRemove, WebAppInfo)
 
-from . import cdek, config, db, payments
+from . import cdek, config, db, payments, render
 
 log = logging.getLogger("bot")
 
@@ -86,6 +88,27 @@ def webapp_button(text="Собрать футболку 👕", path="/webapp/"):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=text, web_app=WebAppInfo(url=config.WEBAPP_URL + path))
     ]])
+
+
+def start_kb():
+    """Кнопки под приветствием: конструктор и свои заказы."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Собрать футболку 👕",
+                              web_app=WebAppInfo(url=config.WEBAPP_URL + "/webapp/"))],
+        [InlineKeyboardButton(text="Мои заказы 🧾", callback_data="my:list")],
+    ])
+
+
+async def setup_commands():
+    """Меню команд бота (кнопка «/» рядом с полем ввода)."""
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="Собрать футболку"),
+             BotCommand(command="orders", description="Мои заказы")],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+    except Exception as e:
+        log.warning("Не удалось установить меню команд: %s", e)
 
 
 def phone_keyboard():
@@ -167,8 +190,11 @@ async def diag(m: Message):
     else:
         lines.append("Доставка: только самовывоз (DELIVERY_CDEK выключен)")
 
+    quota = (f"{db.orders_today()} из {config.ONLINE_QUOTA_PER_DAY}"
+             if config.quota_enabled()
+             else f"{db.orders_today()} (дневная квота выключена)")
     lines += ["", f"Мини-апп: {config.WEBAPP_URL}/webapp/",
-              f"Заказов сегодня: {db.orders_today()} из {config.ONLINE_QUOTA_PER_DAY}"]
+              f"Заказов сегодня: {quota}"]
     await m.answer("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -213,11 +239,6 @@ async def start_deep(m: Message, command: CommandObject):
 
 @dp.message(CommandStart())
 async def start(m: Message):
-    left = db.quota_left()
-    quota_line = (
-        f"На сегодня осталось мест: {left}."
-        if left > 0 else "На сегодня места закончились — заказ уедет на завтра."
-    )
     get_line = (f"📍 Самовывоз: {config.PICKUP_TEXT}\n🚚 Или доставка СДЭК по России."
                 if cdek.enabled() else f"📍 {config.PICKUP_TEXT}")
     await m.answer(
@@ -226,9 +247,8 @@ async def start(m: Message):
         "на груди, на спине и на рукавах. Мы запечатаем, а ты просто "
         "заберёшь готовую.\n\n"
         f"{get_line}\n"
-        f"⚡ {quota_line}\n"
         f"🕐 Храним готовый заказ {config.PICKUP_HOLD_DAYS} дней.",
-        reply_markup=webapp_button(),
+        reply_markup=start_kb(),
     )
     if config.YOOKASSA_SEND_RECEIPT and not db.get_phone(m.from_user.id):
         await ask_phone(m.from_user.id)
@@ -259,6 +279,159 @@ async def got_contact(m: Message):
     db.set_phone(m.from_user.id, m.contact.phone_number)
     await m.answer("Записал, спасибо. Возвращайся в конструктор 👕",
                    reply_markup=ReplyKeyboardRemove())
+
+
+# ---------- Мои заказы: карточка для покупателя ----------
+
+# Покупателю показываем состояние человеческим языком: у сотрудника
+# в тех же статусах свои формулировки, они здесь не подходят.
+CUSTOMER_STATUS = {
+    "new": "🕐 Ждём оплату",
+    "paid": "✅ Оплачен, в очереди",
+    "in_progress": "🔥 Запечатываем",
+    "ready": "📦 Готов",
+    "shipped": "🚚 Едет",
+    "done": "🤝 Выдан",
+    "cancelled": "❌ Отменён",
+}
+
+
+def customer_card_text(o: dict) -> str:
+    """Подпись под картинкой раскладки: номер, статус, сумма, куда едет."""
+    goods = payments.goods_price(o)
+    lines = [
+        f"🧾 Заказ №{o['id']} — {CUSTOMER_STATUS.get(o['status'], o['status'])}",
+        f"Размер {o['size']} · принтов: {len(o['items'])}",
+    ]
+    if o.get("delivery_price"):
+        lines.append(f"Сумма {o['price']} ₽ ({goods} + {o['delivery_price']} доставка)")
+    else:
+        lines.append(f"Сумма {o['price']} ₽")
+
+    method = o["delivery_method"]
+    if method == "pickup":
+        lines.append(f"Получение: самовывоз — {config.PICKUP_TEXT}")
+    else:
+        lines.append(f"Получение: {DELIVERY_LABELS.get(method, method)}")
+        where = o.get("pvz_address") or o.get("address") or o.get("city_name")
+        if where:
+            lines.append(where)
+    if o.get("cdek_number"):
+        lines.append(f"Трек-номер: {o['cdek_number']}")
+    if o.get("cdek_status_text"):
+        lines.append(f"СДЭК: {o['cdek_status_text']}")
+
+    if o["status"] == "new" and config.ORDER_HOLD_MINUTES:
+        lines.append(f"\nБез оплаты заказ живёт {config.ORDER_HOLD_MINUTES} минут.")
+    if o["status"] == "ready" and method == "pickup":
+        lines.append(f"\nНазови номер заказа на кассе. Храним {config.PICKUP_HOLD_DAYS} дней.")
+    return "\n".join(lines)
+
+
+def customer_card_kb(o: dict) -> InlineKeyboardMarkup:
+    rows = []
+    if o["status"] == "new" and payments.enabled():
+        rows.append([InlineKeyboardButton(text="Оплатить 💳",
+                                          callback_data=f"my:pay:{o['id']}")])
+    if o.get("cdek_number"):
+        rows.append([InlineKeyboardButton(text="Отследить 🚚",
+                                          url=cdek.tracking_url(o["cdek_number"]))])
+    rows.append([InlineKeyboardButton(text="Обновить ↻", callback_data=f"my:one:{o['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_customer_card(o: dict, chat_id: int):
+    """Одна карточка: картинка раскладки + весь текст подписью.
+
+    Если раскладку нарисовать не удалось (нет картинки принта, битый файл),
+    отправляем то же самое текстом — заказ важнее картинки.
+    """
+    text, kb = customer_card_text(o), customer_card_kb(o)
+    img = render.order_image(o)
+    if img:
+        try:
+            await bot.send_photo(
+                chat_id, BufferedInputFile(img, filename=f"order_{o['id']}.png"),
+                caption=text, reply_markup=kb)
+            return
+        except Exception as e:
+            log.warning("Карточка заказа №%s не ушла картинкой: %s", o["id"], e)
+    await bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
+
+
+async def show_my_orders(user_id: int, chat_id: int):
+    orders = db.active_orders(user_id)
+    if not orders:
+        await bot.send_message(
+            chat_id, "Активных заказов нет. Собери футболку — она появится здесь.",
+            reply_markup=webapp_button())
+        return
+    for o in orders:
+        await send_customer_card(o, chat_id)
+
+
+@dp.message(Command("orders"))
+async def my_orders(m: Message):
+    await show_my_orders(m.from_user.id, m.chat.id)
+
+
+@dp.callback_query(F.data == "my:list")
+async def cb_my_list(cb: CallbackQuery):
+    await cb.answer()
+    await show_my_orders(cb.from_user.id, cb.message.chat.id)
+
+
+@dp.callback_query(F.data.startswith("my:one:"))
+async def cb_my_refresh(cb: CallbackQuery):
+    oid = int(cb.data.rsplit(":", 1)[1])
+    o = db.get_order(oid)
+    if not o or o["user_id"] != cb.from_user.id:
+        await cb.answer("Заказ не найден", show_alert=True)
+        return
+    text, kb = customer_card_text(o), customer_card_kb(o)
+    try:
+        if cb.message.photo:
+            await cb.message.edit_caption(caption=text, reply_markup=kb)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb,
+                                       disable_web_page_preview=True)
+        await cb.answer("Обновил")
+    except Exception:
+        # Телеграм не даёт переписать сообщение тем же текстом — это не ошибка
+        await cb.answer("Пока без изменений")
+
+
+@dp.callback_query(F.data.startswith("my:pay:"))
+async def cb_my_pay(cb: CallbackQuery):
+    """Ссылку выпускаем заново: старая могла протухнуть или не дойти.
+    Ключ идемпотентности меняем временем, иначе ЮKassa вернёт тот же платёж."""
+    oid = int(cb.data.rsplit(":", 1)[1])
+    o = db.get_order(oid)
+    if not o or o["user_id"] != cb.from_user.id:
+        await cb.answer("Заказ не найден", show_alert=True)
+        return
+    if o["status"] != "new":
+        await cb.answer("Этот заказ уже оплачен", show_alert=True)
+        return
+    await cb.answer("Готовлю ссылку…")
+    try:
+        created = await payments.create_payment(o, attempt=int(time.time()))
+    except payments.PaymentError as e:
+        log.warning("Ссылка на оплату по заказу №%s не выпустилась: %s", oid, e)
+        await bot.send_message(cb.message.chat.id,
+                               "Со ссылкой вышла заминка — уже разбираемся.")
+        await alert_staff(f"⚠️ Заказ №{oid}: покупатель нажал «Оплатить», "
+                          f"ссылка не выпустилась.\n{e}")
+        return
+    if not created:
+        await bot.send_message(cb.message.chat.id,
+                               "Оплату принимаем вручную — сейчас пришлём реквизиты.")
+        await alert_staff(f"Заказ №{oid}: покупатель просит реквизиты для оплаты.")
+        return
+    pay_url, payment_id = created
+    db.set_payment_id(oid, payment_id)
+    await bot.send_message(cb.message.chat.id,
+                           f"Заказ №{oid}, сумма {o['price']} ₽:\n{pay_url}")
 
 
 # ---------- Карточка заказа в чате сотрудников ----------
@@ -570,4 +743,7 @@ async def notify_customer_order_created(o: dict, pay_url: str | None):
         text = (f"Заказ №{o['id']} создан! Сумма {o['price']} ₽.\n"
                 "Сейчас напишем тебе реквизиты для оплаты. "
                 "После подтверждения оплаты возьмём футболку в работу.")
-    await bot.send_message(o["user_id"], text + tail)
+    await bot.send_message(
+        o["user_id"], text + tail,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Мои заказы 🧾", callback_data="my:list")]]))

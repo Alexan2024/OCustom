@@ -218,9 +218,15 @@ def sync_stickers_from_csv():
 # ---------- Стикеры ----------
 
 def active_stickers():
+    """Весь живой каталог, включая разобранные принты.
+
+    Нулевой остаток из выдачи не убираем: мини-апп показывает такой принт
+    бледным со штампом SOLD OUT. Спрятать его было бы хуже — человек
+    решил бы, что принт вообще не существует.
+    """
     with conn() as c:
         rows = c.execute(
-            "SELECT * FROM stickers WHERE active=1 AND stock>0 ORDER BY sort, id"
+            "SELECT * FROM stickers WHERE active=1 ORDER BY sort, id"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -261,7 +267,10 @@ def orders_today() -> int:
     return row["n"]
 
 
-def quota_left() -> int:
+def quota_left() -> int | None:
+    """Сколько заказов ещё примем сегодня. None — ограничения нет."""
+    if not config.quota_enabled():
+        return None
     return max(0, config.ONLINE_QUOTA_PER_DAY - orders_today())
 
 
@@ -288,13 +297,14 @@ def create_order(user, size: str, items: list, price: int,
     today = now_local().strftime("%Y-%m-%d")
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        # квота
-        n = c.execute(
-            "SELECT COUNT(*) n FROM orders "
-            "WHERE date(created_at)=? AND status!='cancelled'", (today,)
-        ).fetchone()["n"]
-        if n >= config.ONLINE_QUOTA_PER_DAY:
-            raise OrderError("Квота онлайн-заказов на сегодня исчерпана. Попробуй завтра!")
+        # квота (по умолчанию выключена: ONLINE_QUOTA_PER_DAY=0)
+        if config.quota_enabled():
+            n = c.execute(
+                "SELECT COUNT(*) n FROM orders "
+                "WHERE date(created_at)=? AND status!='cancelled'", (today,)
+            ).fetchone()["n"]
+            if n >= config.ONLINE_QUOTA_PER_DAY:
+                raise OrderError("Заказов на сегодня больше не принимаем. Попробуй завтра!")
         # остатки
         need: dict[int, int] = {}
         for it in items:
@@ -331,6 +341,22 @@ def create_order(user, size: str, items: list, price: int,
                  round(it["x_mm"], 1), round(it["y_mm"], 1), it["rotation"]),
             )
     return get_order(oid)
+
+
+ACTIVE_STATUSES = ("new", "paid", "in_progress", "ready", "shipped")
+
+
+def active_orders(user_id: int) -> list[dict]:
+    """Незакрытые заказы покупателя — для кнопки «Мои заказы» в боте.
+    Выданные и отменённые не показываем."""
+    q = ",".join("?" * len(ACTIVE_STATUSES))
+    with conn() as c:
+        rows = c.execute(
+            f"SELECT id FROM orders WHERE user_id=? AND status IN ({q}) "
+            "ORDER BY id DESC LIMIT 10",
+            (user_id, *ACTIVE_STATUSES),
+        ).fetchall()
+    return [o for o in (get_order(r["id"]) for r in rows) if o]
 
 
 def get_order(oid: int) -> dict | None:

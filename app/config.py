@@ -82,7 +82,13 @@ MAX_PRINTS = int(_env("MAX_PRINTS", "5"))           # потолок по вре
 # в MAX_PRINTS и в дневную квоту наравне с грудью и спиной.
 
 # --- Квота онлайн-заказов в день ---
-ONLINE_QUOTA_PER_DAY = int(_env("ONLINE_QUOTA_PER_DAY", "8"))
+# 0 — ограничения нет (значение по умолчанию). Любое положительное число
+# включает потолок обратно: столько заказов в сутки бот примет и не больше.
+ONLINE_QUOTA_PER_DAY = int(_env("ONLINE_QUOTA_PER_DAY", "0"))
+
+
+def quota_enabled() -> bool:
+    return ONLINE_QUOTA_PER_DAY > 0
 
 # --- Срок хранения готового заказа (показывается пользователю) ---
 PICKUP_HOLD_DAYS = int(_env("PICKUP_HOLD_DAYS", "5"))
