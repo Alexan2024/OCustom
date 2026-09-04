@@ -363,6 +363,31 @@ async def fetch_shipment(uuid: str) -> dict:
     }
 
 
+async def check() -> list[str]:
+    """Самопроверка для /diag: живы ли ключи и существует ли ПВЗ отправки."""
+    out = []
+    await _access_token()
+    out.append("✅ ключи приняты")
+    code = config.CDEK_SHIPMENT_POINT
+    if not code:
+        out.append("❌ CDEK_SHIPMENT_POINT не задан — накладные не создаются")
+        return out
+    data = await _call("GET", "/deliverypoints", params={"code": code})
+    pts = data if isinstance(data, list) else []
+    if not pts:
+        out.append(f"❌ ПВЗ {code} не найден")
+        return out
+    p = pts[0]
+    loc = p.get("location") or {}
+    out.append(f"✅ ПВЗ {code}: {loc.get('address_full') or loc.get('address')}")
+    if not p.get("is_reception"):
+        out.append(f"❌ {code} не принимает отправления — нужен другой пункт")
+    if loc.get("city_code") and loc["city_code"] != config.CDEK_FROM_CITY_CODE:
+        out.append(f"⚠️ CDEK_FROM_CITY_CODE={config.CDEK_FROM_CITY_CODE}, "
+                   f"а ПВЗ в городе {loc['city_code']} — тариф посчитается не оттуда")
+    return out
+
+
 def uuid_from_webhook(body: dict) -> str | None:
     """Из уведомления берём только uuid — дальше идём в API сами."""
     if not isinstance(body, dict):
