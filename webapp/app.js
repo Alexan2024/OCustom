@@ -5,6 +5,10 @@
    На рукаве та же пара означает другое: x идёт вокруг руки (+ к спине),
    y — вниз от проймы. Сторон четыре: front, back, sleeve_l, sleeve_r.
 
+   Поворот свободный, 0..359°. Габарит, по которому принт удерживается
+   в зоне, всегда неповёрнутый: на промежуточных углах углы принта могут
+   выйти за пунктир. Так же считает и сервер — правило одно на обе стороны.
+
    Второй экран — оформление: способ получения, получатель, доставка.
    Цену доставки здесь только показываем; при создании заказа сервер
    пересчитывает её сам и в спорной ситуации побеждает он. */
@@ -16,6 +20,9 @@ tg?.ready(); tg?.expand();
    с Bot API 7.7; на клиентах постарее его нет — там работает страховка
    с touchmove ниже. */
 tg?.disableVerticalSwipes?.();
+/* Шапка Telegram своего цвета оставляла шов над мини-аппом. */
+try { tg?.setHeaderColor?.("#faf9f6"); } catch (e) { /* старый клиент */ }
+try { tg?.setBackgroundColor?.("#faf9f6"); } catch (e) { /* старый клиент */ }
 
 const $ = (id) => document.getElementById(id);
 const SLEEVES = ["sleeve_l", "sleeve_r"];
@@ -24,6 +31,8 @@ const SIDE_NAMES = {
   sleeve_l: "левый рукав", sleeve_r: "правый рукав",
 };
 const SLEEVE_SPLIT_MM = 60;   // просвет между схемами рукавов на экране
+const SNAP_DEG = 5;           // магнит поворота к 0/90/180/270
+const STOCK_POLL_MS = 45000;  // как часто переспрашиваем остатки
 
 const METHOD_NAMES = {
   pickup: "Самовывоз",
@@ -41,7 +50,11 @@ const state = {
   ppm: 1,              // px per mm
   zoneEls: {},         // side -> DOM-узел зоны, живёт до следующего layout()
   viewMode: false,
+  preview: false,      // «как выглядит»: без сетки и подписей
   uidSeq: 1,
+  gone: new Set(),     // id принтов, которые разобрали, пока человек собирал
+  catQuery: "",
+  catBySize: false,
   delivery: {
     method: "pickup",
     name: "", phone: "",
@@ -55,21 +68,95 @@ const state = {
 const haptic = (t = "light") => tg?.HapticFeedback?.impactOccurred?.(t);
 const initHeaders = () => ({ "X-Telegram-Init-Data": tg?.initData || "" });
 
+/* ---------- Показ и скрытие с переходом ---------- */
+
+function show(el) {
+  el.classList.remove("hidden");
+  requestAnimationFrame(() => el.classList.add("open"));
+}
+
+function hide(el) {
+  el.classList.remove("open");
+  setTimeout(() => el.classList.add("hidden"), 220);
+}
+
+/* ---------- Кнопка «Назад» Telegram ---------- */
+
+/* Стопка открытых слоёв: аппаратная кнопка на Android иначе закрывала
+   весь мини-апп, а не панель поверх него. */
+const navStack = [];
+
+function pushNav(close) {
+  navStack.push(close);
+  syncBack();
+}
+
+function dropNav(close) {
+  const i = navStack.lastIndexOf(close);
+  if (i >= 0) navStack.splice(i, 1);
+  syncBack();
+}
+
+function syncBack() {
+  const bb = tg?.BackButton;
+  if (!bb) return;
+  navStack.length ? bb.show?.() : bb.hide?.();
+}
+
+tg?.BackButton?.onClick?.(() => {
+  const close = navStack[navStack.length - 1];
+  if (close) close();
+});
+
+/* ---------- Тосты ---------- */
+
+function toast(text, opts = {}) {
+  const box = $("toasts");
+  const el = document.createElement("div");
+  el.className = "toast" + (opts.warn ? " warn" : "");
+  const span = document.createElement("span");
+  span.textContent = text;
+  el.appendChild(span);
+  let timer;
+  const close = () => {
+    clearTimeout(timer);
+    el.classList.remove("on");
+    setTimeout(() => el.remove(), 220);
+  };
+  if (opts.action) {
+    const b = document.createElement("button");
+    b.textContent = opts.action.label;
+    b.onclick = () => { opts.action.fn(); close(); };
+    el.appendChild(b);
+  }
+  box.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("on"));
+  timer = setTimeout(close, opts.ms || (opts.action ? 5000 : 2600));
+  return close;
+}
+
 /* ---------- Загрузка ---------- */
 
 async function boot() {
-  const [cfg, stickers] = await Promise.all([
-    fetch("/api/config").then(r => r.json()),
-    fetch("/api/stickers").then(r => r.json()),
-  ]);
+  let cfg, stickers;
+  try {
+    [cfg, stickers] = await Promise.all([
+      fetch("/api/config").then(r => r.json()),
+      fetch("/api/stickers").then(r => r.json()),
+    ]);
+  } catch (e) {
+    $("boot").innerHTML = "<p style='padding:40px;text-align:center'>" +
+      "Не получилось загрузить каталог. Открой мини-апп ещё раз.</p>";
+    return;
+  }
   state.cfg = cfg; state.stickers = stickers;
   const params = new URLSearchParams(location.search);
   if (params.get("view")) return bootView(params.get("view"), params.get("key"));
 
-  state.size = Object.keys(cfg.sizes).find(s => cfg.sizes[s].stock > 0) || "M";
-  $("quota").textContent = cfg.quota_left > 0
-    ? `сегодня осталось мест: ${cfg.quota_left}` : "на сегодня мест нет";
+  state.size = Object.keys(cfg.sizes).find(s => cfg.sizes[s].stock > 0)
+    || Object.keys(cfg.sizes)[0];
   renderSizes(); renderCatalog(); layout(); renderAll(); updateBar();
+  hideBoot();
 
   // Имя и телефон, если человек их уже давал — чтобы не вводил заново
   if (cfg.delivery?.cdek) {
@@ -82,23 +169,73 @@ async function boot() {
       })
       .catch(() => {});
   }
+
+  setInterval(refreshStock, STOCK_POLL_MS);
+}
+
+function hideBoot() {
+  const b = $("boot");
+  if (!b) return;
+  b.classList.add("fade");
+  setTimeout(() => b.remove(), 300);
 }
 
 async function bootView(oid, key) {
   state.viewMode = true;
   const r = await fetch(`/api/orders/${oid}?key=${encodeURIComponent(key)}`);
-  if (!r.ok) { document.body.innerHTML = "<p style='padding:40px'>Заказ не найден</p>"; return; }
+  if (!r.ok) {
+    document.body.innerHTML = "<p style='padding:40px'>Заказ не найден</p>";
+    return;
+  }
   const o = await r.json();
   state.size = o.size;
   state.placed = o.items.map(i => ({
     uid: state.uidSeq++, side: i.side, x_mm: i.x_mm, y_mm: i.y_mm, rotation: i.rotation,
     s: { id: i.sticker_id, name: i.name, file: i.file, width_mm: i.width_mm, height_mm: i.height_mm },
   }));
-  $("quota").textContent = `заказ №${o.id} · ${o.size} · ${o.price} ₽`;
   document.querySelector(".controls .sizes").remove();
   document.querySelector(".bottom").remove();
-  $("hint").textContent = "Режим просмотра: раскладка как её собрал клиент.";
-  layout(); renderAll();
+  $("hint").textContent = `Заказ №${o.id} · размер ${o.size} · ${o.price} ₽ — раскладка как её собрал клиент.`;
+  layout(); renderAll(); hideBoot();
+}
+
+/* Остатки живые: пока человек собирает футболку, принт мог разобрать
+   кто-то другой. Переспрашиваем каталог и помечаем то, чего уже нет. */
+async function refreshStock() {
+  if (state.viewMode) return;
+  let list;
+  try {
+    list = await fetch("/api/stickers").then(r => r.json());
+  } catch (e) { return; }
+  if (!Array.isArray(list)) return;
+  state.stickers = list;
+  const byId = new Map(list.map(s => [s.id, s]));
+  for (const p of state.placed) {
+    const fresh = byId.get(p.s.id);
+    if (fresh) p.s = { ...p.s, stock: fresh.stock, active: fresh.active };
+  }
+  const wasGone = new Set(state.gone);
+  markGone();
+  for (const id of state.gone) {
+    if (!wasGone.has(id)) {
+      const p = state.placed.find(x => x.s.id === id);
+      toast(`«${p ? p.s.name : id}» разобрали — замени принт`, { warn: true });
+      haptic("heavy");
+      break;
+    }
+  }
+  if (!$("sheet").classList.contains("hidden")) renderCatalog();
+  renderAll();
+}
+
+function markGone() {
+  const need = {};
+  for (const p of state.placed) need[p.s.id] = (need[p.s.id] || 0) + 1;
+  state.gone = new Set();
+  for (const p of state.placed) {
+    const stock = p.s.stock == null ? Infinity : p.s.stock;
+    if (need[p.s.id] > stock || p.s.active === 0) state.gone.add(p.s.id);
+  }
 }
 
 /* ---------- Размеры ---------- */
@@ -107,23 +244,39 @@ function renderSizes() {
   const el = $("sizes"); el.innerHTML = "";
   for (const [s, v] of Object.entries(state.cfg.sizes)) {
     const b = document.createElement("button");
-    b.className = "size-chip" + (s === state.size ? " active" : "");
+    // Количества покупателю не показываем: нет в наличии — просто серый чип.
+    b.className = "size-chip" + (s === state.size ? " active" : "")
+      + (wontFit(s).length ? " tight" : "");
     b.disabled = v.stock <= 0;
-    b.innerHTML = `${s}<small>${v.stock > 0 ? "ост. " + v.stock : "нет"}</small>`;
-    b.onclick = () => {
-      state.size = s;
-      // зоны у размеров разные — то, что перестало влезать, надо убрать
-      const dropped = state.placed.filter(p => !fitsZone(p.s, p.side, p.rotation));
-      if (dropped.length) {
-        state.placed = state.placed.filter(p => fitsZone(p.s, p.side, p.rotation));
-        tg?.showAlert?.(`На размере ${s} не помещается: ` +
-          dropped.map(p => p.s.name).join(", "));
-      }
-      state.placed.forEach(clamp);
-      renderSizes(); layout(); renderAll(); renderCatalog(); haptic();
-    };
+    b.textContent = s;
+    b.onclick = () => setSize(s);
     el.appendChild(b);
   }
+}
+
+/* Что из уже разложенного не влезет на другой размер */
+function wontFit(size) {
+  if (size === state.size) return [];
+  const zs = state.cfg.sizes[size]?.zones;
+  if (!zs) return [];
+  return state.placed.filter(p => {
+    const z = zs[p.side];
+    return !z || p.s.width_mm > z.w_mm || p.s.height_mm > z.h_mm;
+  });
+}
+
+function setSize(s) {
+  if (s === state.size) return;
+  const dropped = wontFit(s);
+  state.size = s;
+  if (dropped.length) {
+    const uids = new Set(dropped.map(p => p.uid));
+    state.placed = state.placed.filter(p => !uids.has(p.uid));
+    toast(`На размере ${s} не помещается: ` +
+      dropped.map(p => p.s.name).join(", "), { warn: true });
+  }
+  state.placed.forEach(clamp);
+  renderSizes(); layout(); renderAll(); renderCatalog(); haptic();
 }
 
 /* ---------- Геометрия сцены ---------- */
@@ -139,7 +292,8 @@ function makeZone(side) {
   el.style.width = z.w_mm * state.ppm + "px";
   el.style.height = z.h_mm * state.ppm + "px";
   el.style.setProperty("--tick", (50 * state.ppm) + "px");   // риска = 50 мм
-  el.innerHTML = '<div class="zone-center"></div>';
+  el.innerHTML = `<div class="zone-center"></div>
+    <div class="zone-tag">зона ${Math.round(z.w_mm)}×${Math.round(z.h_mm)} мм</div>`;
   el.addEventListener("pointerdown", (e) => {
     if (e.target !== el && !e.target.classList.contains("zone-center")) return;
     state.sel = null;
@@ -225,18 +379,17 @@ function layoutSleeves(availW, availH) {
   $("stage").appendChild(wrap);
 }
 
-/* эффективные (с учётом поворота) полуразмеры, мм */
+/* Габарит, которым принт держится в зоне. Поворот его не меняет: на углах,
+   кратных 90°, картинка честно совпадает с прямоугольником, на остальных
+   углы принта выходят за пунктир — это разрешено сознательно, иначе
+   свободный поворот упирался бы в рамку на каждом шаге. */
 function halfDims(p) {
-  let w = p.s.width_mm, h = p.s.height_mm;
-  if (p.rotation % 180 !== 0) [w, h] = [h, w];
-  return [w / 2, h / 2];
+  return [p.s.width_mm / 2, p.s.height_mm / 2];
 }
 
-function fitsZone(s, side, rotation = 0) {
+function fitsZone(s, side) {
   const z = zoneOf(side);
-  let [w, h] = [s.width_mm, s.height_mm];
-  if (rotation % 180 !== 0) [w, h] = [h, w];
-  return w <= z.w_mm && h <= z.h_mm;
+  return s.width_mm <= z.w_mm && s.height_mm <= z.h_mm;
 }
 
 function clamp(p) {
@@ -264,30 +417,46 @@ function anyTooClose() {
   return false;
 }
 
-/* ---------- Рендер стикеров ---------- */
+/* ---------- Рендер принтов ---------- */
 
 function renderAll() {
   for (const side of visibleSides()) {
     const zEl = state.zoneEls[side];
     if (!zEl) continue;
-    zEl.querySelectorAll(".sticker").forEach(e => e.remove());
+    zEl.querySelectorAll(".sticker, .zone-ghost").forEach(e => e.remove());
     const z = zoneOf(side);
-    for (const p of state.placed.filter(p => p.side === side)) {
+    const mine = state.placed.filter(p => p.side === side);
+
+    if (!mine.length && !state.viewMode && side === state.target) {
+      const ghost = document.createElement("div");
+      ghost.className = "zone-ghost";
+      ghost.innerHTML = "<b>+</b><span>добавить принт</span>";
+      ghost.onclick = openSheet;
+      zEl.appendChild(ghost);
+    }
+
+    for (const p of mine) {
       const d = document.createElement("div");
       d.className = "sticker";
       d.dataset.uid = p.uid;
       d.style.width = p.s.width_mm * state.ppm + "px";
       d.style.height = p.s.height_mm * state.ppm + "px";
-      d.style.left = (z.w_mm / 2 + p.x_mm) * state.ppm + "px";
-      d.style.top = p.y_mm * state.ppm + "px";
-      d.style.transform = `translate(-50%,-50%) rotate(${p.rotation}deg)`;
+      place(d, p);
       d.innerHTML = `<img src="/stickers/${p.s.file}" draggable="false">
-        <div class="dim">${p.s.width_mm}×${p.s.height_mm} мм</div>`;
+        <div class="dim">${p.s.width_mm}×${p.s.height_mm} мм</div>
+        <div class="rot-handle">⟲</div>`;
       if (!state.viewMode) attachDrag(d, p);
       zEl.appendChild(d);
     }
   }
   refreshFlags();
+}
+
+function place(el, p) {
+  const z = zoneOf(p.side);
+  el.style.left = (z.w_mm / 2 + p.x_mm) * state.ppm + "px";
+  el.style.top = p.y_mm * state.ppm + "px";
+  el.style.transform = `translate(-50%,-50%) rotate(${p.rotation}deg)`;
 }
 
 function refreshFlags() {
@@ -298,87 +467,239 @@ function refreshFlags() {
       if (tooClose(ps[i], ps[j])) { bad.add(ps[i].uid); bad.add(ps[j].uid); }
   document.querySelectorAll(".sticker").forEach(el => {
     const uid = +el.dataset.uid;
+    const p = state.placed.find(x => x.uid === uid);
     el.classList.toggle("overlap", bad.has(uid));
+    el.classList.toggle("gone", !!p && state.gone.has(p.s.id));
     el.classList.toggle("selected", state.sel === uid && !bad.has(uid));
   });
-  $("selTools").classList.toggle("hidden", state.sel == null || state.viewMode);
+  $("selTools").classList.toggle("on", state.sel != null && !state.viewMode && !state.preview);
+  updateTele();
 
   const hint = $("hint");
-  if (bad.size) {
+  if (state.viewMode) { /* подпись в режиме просмотра ставится один раз */ }
+  else if (state.gone.size) {
+    hint.textContent = "Перечёркнутый принт разобрали, пока ты собирал. Убери его или выбери другой.";
+    hint.className = "hint warn";
+  } else if (bad.size) {
     hint.textContent = `Между принтами нужно ${state.cfg.min_gap_mm} мм — ` +
       "иначе пресс заденет соседний. Раздвинь их.";
     hint.className = "hint warn";
-  } else if (!state.viewMode) {
+  } else {
     hint.textContent = state.view === "sleeves"
       ? `Кладём на ${SIDE_NAMES[state.target]} — тапни другой, чтобы переключить. ` +
         "Левый и правый — как на человеке."
-      : "Тапни принт, чтобы повернуть или убрать. Пунктир — центр.";
+      : "Тапни принт, чтобы повернуть или убрать. Уголок ⟲ — свободный поворот.";
     hint.className = "hint";
   }
   if (!state.viewMode) updateBar();
 }
 
-/* ---------- Drag ---------- */
+/* Телеметрия выбранного принта: где именно он лежит, в миллиметрах */
+function updateTele() {
+  const el = $("tele");
+  const p = state.placed.find(x => x.uid === state.sel);
+  if (!p || state.viewMode || state.preview) { el.classList.remove("on"); return; }
+  const z = zoneOf(p.side);
+  const dx = Math.round(p.x_mm), dy = Math.round(p.y_mm);
+  const axis = p.side.startsWith("sleeve")
+    ? (dx === 0 ? "по центру" : `${Math.abs(dx)} мм ${dx > 0 ? "к спине" : "к переду"}`)
+    : (dx === 0 ? "по центру" : `${Math.abs(dx)} мм ${dx > 0 ? "вправо" : "влево"}`);
+  const from = p.side.startsWith("sleeve") ? "от проймы" : "от верха зоны";
+  const rot = p.rotation ? ` · ${Math.round(p.rotation)}°` : "";
+  el.textContent = `${p.s.width_mm}×${p.s.height_mm} · ${axis} · ${dy} ${from}${rot}` +
+    ` · зона ${Math.round(z.w_mm)}×${Math.round(z.h_mm)}`;
+  el.classList.add("on");
+}
+
+/* ---------- Перетаскивание и поворот ---------- */
+
+function normAngle(a) { return ((a % 360) + 360) % 360; }
+
+/* Магнит к 0/90/180/270 — чтобы «ровно» получалось само */
+function snapAngle(a) {
+  a = normAngle(a);
+  for (const t of [0, 90, 180, 270, 360]) {
+    if (Math.abs(a - t) <= SNAP_DEG) return normAngle(t);
+  }
+  return Math.round(a);
+}
+
+function centerOf(el) {
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
 
 function attachDrag(el, p) {
-  let startX, startY, sx, sy, snapped = false;
+  const pts = new Map();
+  let mode = null;               // move | rotate2
+  let startX, startY, sx, sy, snappedX = false;
+  let baseRot = 0, baseAng = 0, snappedRot = null;
+
+  const pairAngle = () => {
+    const [a, b] = [...pts.values()];
+    return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+  };
+
   el.addEventListener("pointerdown", (e) => {
+    if (e.target.classList.contains("rot-handle")) return;   // у ручки свой обработчик
     e.preventDefault();
     el.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
     state.sel = p.uid;
     if (state.target !== p.side) { state.target = p.side; layoutRefresh(); return; }
+
+    if (pts.size >= 2) {
+      mode = "rotate2";
+      baseRot = p.rotation; baseAng = pairAngle(); snappedRot = null;
+    } else {
+      mode = "move";
+      startX = e.clientX; startY = e.clientY; sx = p.x_mm; sy = p.y_mm;
+      document.body.classList.add("dragging");
+    }
     refreshFlags();
-    startX = e.clientX; startY = e.clientY; sx = p.x_mm; sy = p.y_mm;
-    document.body.classList.add("dragging");
   });
+
   el.addEventListener("pointermove", (e) => {
-    if (startX == null) return;
+    if (!pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (mode === "rotate2" && pts.size >= 2) {
+      const next = snapAngle(baseRot + (pairAngle() - baseAng));
+      if (next % 90 === 0 && snappedRot !== next) { haptic("medium"); snappedRot = next; }
+      if (next % 90 !== 0) snappedRot = null;
+      p.rotation = next;
+      place(el, p); clamp(p); place(el, p); updateTele();
+      return;
+    }
+    if (mode !== "move" || startX == null) return;
+
     p.x_mm = sx + (e.clientX - startX) / state.ppm;
     p.y_mm = sy + (e.clientY - startY) / state.ppm;
     if (Math.abs(p.x_mm) < 4) {                 // снап к центральной оси
       p.x_mm = 0;
-      if (!snapped) { haptic("medium"); snapped = true; }
-    } else snapped = false;
+      if (!snappedX) { haptic("medium"); snappedX = true; }
+    } else snappedX = false;
+    litCenter(p.side, p.x_mm === 0);
     clamp(p);
-    const z = zoneOf(p.side);
-    el.style.left = (z.w_mm / 2 + p.x_mm) * state.ppm + "px";
-    el.style.top = p.y_mm * state.ppm + "px";
+    place(el, p);
     refreshFlags();
   });
-  const end = () => { startX = null; document.body.classList.remove("dragging"); };
+
+  const end = (e) => {
+    pts.delete(e.pointerId);
+    if (pts.size === 0) {
+      mode = null; startX = null;
+      document.body.classList.remove("dragging");
+      litCenter(p.side, false);
+    } else if (mode === "rotate2") {
+      mode = null;
+    }
+  };
   el.addEventListener("pointerup", end);
   el.addEventListener("pointercancel", end);
+
+  // Ручка в углу: свободный поворот одним пальцем
+  const handle = el.querySelector(".rot-handle");
+  if (handle) attachRotate(handle, el, p);
+}
+
+function attachRotate(handle, el, p) {
+  let active = false, baseRot = 0, baseAng = 0, snapped = null;
+  const angTo = (e) => {
+    const c = centerOf(el);
+    return Math.atan2(e.clientY - c.y, e.clientX - c.x) * 180 / Math.PI;
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault(); e.stopPropagation();
+    handle.setPointerCapture(e.pointerId);
+    active = true; baseRot = p.rotation; baseAng = angTo(e); snapped = null;
+    state.sel = p.uid;
+    document.body.classList.add("dragging");
+    refreshFlags();
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!active) return;
+    e.stopPropagation();
+    const next = snapAngle(baseRot + (angTo(e) - baseAng));
+    if (next % 90 === 0 && snapped !== next) { haptic("medium"); snapped = next; }
+    if (next % 90 !== 0) snapped = null;
+    p.rotation = next;
+    clamp(p); place(el, p); updateTele();
+  });
+  const stop = (e) => {
+    if (!active) return;
+    e.stopPropagation();
+    active = false;
+    document.body.classList.remove("dragging");
+    refreshFlags();
+  };
+  handle.addEventListener("pointerup", stop);
+  handle.addEventListener("pointercancel", stop);
+}
+
+function litCenter(side, on) {
+  const z = state.zoneEls[side];
+  z?.querySelector(".zone-center")?.classList.toggle("lit", !!on);
 }
 
 /* ---------- Каталог ---------- */
 
 function usedCount(sid) { return state.placed.filter(p => p.s.id === sid).length; }
 
+function openSheet() {
+  renderCatalog();
+  show($("sheet")); show($("scrim"));
+  pushNav(closeSheet);
+}
+
+function closeSheet() {
+  dropNav(closeSheet);
+  hide($("sheet")); hide($("scrim"));
+}
+
 function renderCatalog() {
   const el = $("catalog"); el.innerHTML = "";
   const side = state.target;
   $("sheetSide").textContent = `на ${SIDE_NAMES[side]}, размеры реальные`;
-  const list = state.stickers.filter(s => fitsZone(s, side));
+
+  let list = state.stickers.filter(s => fitsZone(s, side));
+  const q = state.catQuery.trim().toLowerCase();
+  if (q) list = list.filter(s => String(s.name).toLowerCase().includes(q));
+  if (state.catBySize) {
+    list = [...list].sort((a, b) =>
+      (b.width_mm * b.height_mm) - (a.width_mm * a.height_mm));
+  }
+
   if (!list.length) {
-    el.innerHTML = `<div class="empty">В зону ${SIDE_NAMES[side]} ` +
-      `(${zoneOf(side).w_mm}×${zoneOf(side).h_mm} мм) ни один принт не помещается.</div>`;
+    el.innerHTML = `<div class="empty">${q ? "Ничего не нашлось." :
+      `В зону ${SIDE_NAMES[side]} (${Math.round(zoneOf(side).w_mm)}×` +
+      `${Math.round(zoneOf(side).h_mm)} мм) ни один принт не помещается.`}</div>`;
     return;
   }
+
+  // Превью в общем масштабе: крупный принт и выглядит крупнее мелкого
+  const maxW = Math.max(...list.map(s => s.width_mm));
+  const maxH = Math.max(...list.map(s => s.height_mm));
+  const k = Math.min(88 / maxW, 72 / maxH);
+
   for (const s of list) {
-    const left = s.stock - usedCount(s.id);
+    const left = (s.stock == null ? Infinity : s.stock) - usedCount(s.id);
+    const out = left <= 0;
     const d = document.createElement("div");
-    d.className = "cat-item" + (left <= 0 ? " out" : "");
-    d.innerHTML = `<img src="/stickers/${s.file}"><div class="nm">${s.name}</div>
+    d.className = "cat-item" + (out ? " out" : "");
+    d.innerHTML = `<div class="ph"><img src="/stickers/${s.file}"
+        style="width:${Math.max(10, s.width_mm * k)}px;height:${Math.max(10, s.height_mm * k)}px"></div>
+      <div class="nm">${s.name}</div>
       <div class="sz">${s.width_mm}×${s.height_mm} мм</div>
-      <div class="st">${left > 0 ? "осталось " + left : "разобрали"}</div>`;
-    d.onclick = () => addSticker(s);
+      ${out ? '<div class="soldout">SOLD OUT</div>' : ""}`;
+    if (!out) d.onclick = () => addSticker(s);
     el.appendChild(d);
   }
 }
 
 function addSticker(s) {
   if (state.placed.length >= state.cfg.max_prints) {
-    tg?.showAlert?.(`Максимум ${state.cfg.max_prints} принтов на футболку — иначе запечатка займёт вечность.`);
+    toast(`Максимум ${state.cfg.max_prints} принтов на футболку`, { warn: true });
     return;
   }
   const side = state.target;
@@ -392,7 +713,34 @@ function addSticker(s) {
   }
   state.placed.push(p);
   state.sel = p.uid;
-  closeSheet(); renderAll(); renderCatalog(); haptic();
+  markGone();
+  // Лист не закрываем: чаще всего принтов кладут несколько подряд.
+  renderAll(); renderCatalog(); renderSizes(); haptic();
+  toast(`«${s.name}» на ${SIDE_NAMES[side]}`, {
+    ms: 2000,
+    action: { label: "Готово", fn: closeSheet },
+  });
+}
+
+function removeSelected() {
+  const p = state.placed.find(x => x.uid === state.sel);
+  if (!p) return;
+  const idx = state.placed.indexOf(p);
+  state.placed.splice(idx, 1);
+  state.sel = null;
+  markGone();
+  renderAll(); renderCatalog(); renderSizes(); haptic();
+  toast(`Убрали «${p.s.name}»`, {
+    action: {
+      label: "Вернуть",
+      fn: () => {
+        state.placed.splice(Math.min(idx, state.placed.length), 0, p);
+        state.sel = p.uid;
+        markGone();
+        renderAll(); renderCatalog(); renderSizes(); haptic();
+      },
+    },
+  });
 }
 
 /* ---------- Панель и цена ---------- */
@@ -410,7 +758,7 @@ function updateBar() {
   $("price").innerHTML = n
     ? `${goodsPrice()} ₽<small>${n} принт(а) · ${c.included_prints} включено</small>`
     : `${c.base_price} ₽<small>${c.included_prints} принта включено</small>`;
-  $("btnOrder").disabled = n === 0 || anyTooClose() || c.quota_left <= 0;
+  $("btnOrder").disabled = n === 0 || anyTooClose() || state.gone.size > 0;
 }
 
 /* ---------- Оформление ---------- */
@@ -418,11 +766,12 @@ function updateBar() {
 function openCheckout() {
   // Пока доставка выключена, второй экран не нужен: способ получения один.
   if (!state.cfg.delivery?.cdek) return submitOrder();
-  $("checkout").classList.remove("hidden");
+  show($("checkout"));
+  pushNav(closeCheckout);
   renderCheckout();
 }
 
-function closeCheckout() { $("checkout").classList.add("hidden"); }
+function closeCheckout() { dropNav(closeCheckout); hide($("checkout")); }
 
 function setMethod(m) {
   if (state.delivery.method === m) return;
@@ -536,7 +885,7 @@ function updateCheckoutInfo() {
   }
   const calc = $("coCalc");
   if (calc) {
-    if (d.calcing) { calc.className = "co-calc"; calc.textContent = "считаем доставку…"; }
+    if (d.calcing) { calc.className = "co-calc load"; calc.textContent = "считаем доставку"; }
     else if (d.error) { calc.className = "co-calc err"; calc.textContent = d.error; }
     else if (!d.city) { calc.className = "co-calc"; calc.textContent = ""; }
     else if (d.price === 0) { calc.className = "co-calc"; calc.textContent = `доставка бесплатно${d.period ? ", " + d.period : ""}`; }
@@ -551,6 +900,7 @@ function updateCheckoutInfo() {
 
 function checkoutReady() {
   const d = state.delivery;
+  if (state.gone.size) return false;
   if (d.method === "pickup") return true;
   if (d.calcing || d.error) return false;
   if (d.name.trim().length < 2) return false;
@@ -590,7 +940,8 @@ let pickTimer = null;
 let pickPoints = [];   // кэш ПВЗ текущего города
 
 function openPicker(title, placeholder, onInput) {
-  $("pick").classList.remove("hidden");
+  show($("pick"));
+  pushNav(closePicker);
   $("pickTitle").textContent = title;
   const inp = $("pickInput");
   inp.value = ""; inp.placeholder = placeholder;
@@ -599,10 +950,14 @@ function openPicker(title, placeholder, onInput) {
     pickTimer = setTimeout(() => onInput(inp.value), 300);
   };
   $("pickList").innerHTML = "";
-  setTimeout(() => inp.focus(), 60);
+  setTimeout(() => inp.focus(), 120);
 }
 
-function closePicker() { $("pick").classList.add("hidden"); clearTimeout(pickTimer); }
+function closePicker() {
+  dropNav(closePicker);
+  hide($("pick"));
+  clearTimeout(pickTimer);
+}
 
 function pickMessage(text) {
   $("pickList").innerHTML = `<div class="pick-empty">${text}</div>`;
@@ -711,7 +1066,8 @@ async function submitOrder() {
     size: state.size,
     items: state.placed.map(p => ({
       side: p.side, sticker_id: p.s.id,
-      x_mm: +p.x_mm.toFixed(1), y_mm: +p.y_mm.toFixed(1), rotation: p.rotation,
+      x_mm: +p.x_mm.toFixed(1), y_mm: +p.y_mm.toFixed(1),
+      rotation: Math.round(p.rotation) % 360,
     })),
     delivery: deliveryPayload(),
   };
@@ -724,17 +1080,23 @@ async function submitOrder() {
     });
     data = await r.json().catch(() => ({}));
   } catch (e) {
-    tg?.showAlert?.("Сеть подвела. Попробуй ещё раз.");
+    toast("Сеть подвела. Попробуй ещё раз.", { warn: true });
     btn.disabled = false; btn.textContent = label;
     return;
   }
   if (!r.ok) {
     tg?.showAlert?.(data.detail || "Не получилось создать заказ");
     btn.disabled = false; btn.textContent = label;
+    refreshStock();
     return;
   }
   haptic("heavy");
+  btn.disabled = false; btn.textContent = label;
   closeCheckout();
+  showSuccess(data);
+}
+
+function showSuccess(data) {
   const hold = data.hold_minutes
     ? `<br><br>Ссылка ждёт ${data.hold_minutes} минут — потом принты вернутся в каталог.`
     : "";
@@ -742,14 +1104,22 @@ async function submitOrder() {
     ? "Заберёшь в поп-апе — пришлём адрес, когда будет готово."
     : `Доставка: ${METHOD_NAMES[data.delivery_method]}. Трек-номер пришлём в чат.`;
   const ov = $("overlay");
-  ov.classList.remove("hidden");
   ov.innerHTML = `
     <h2>Заказ принят</h2>
     <div class="num">№${data.order_id}</div>
     <p>Сумма ${data.price} ₽${data.delivery_price ? ` (с доставкой ${data.delivery_price} ₽)` : ""}.
     ${data.pay_url ? "Ссылка на оплату — в чате с ботом." : "Реквизиты для оплаты придут в чат с ботом."}${hold}<br><br>
-    ${where}</p>`;
-  setTimeout(() => tg?.close?.(), data.pay_url ? 2200 : 2800);
+    ${where}</p>
+    <div class="acts">
+      ${data.pay_url ? '<button class="order-btn" id="ovPay">Оплатить</button>' : ""}
+      <button class="ghost-btn" id="ovClose">Закрыть</button>
+    </div>`;
+  show(ov);
+  const pay = $("ovPay");
+  if (pay) pay.onclick = () => {
+    tg?.openLink ? tg.openLink(data.pay_url) : window.open(data.pay_url, "_blank");
+  };
+  $("ovClose").onclick = () => tg?.close?.();
 }
 
 /* ---------- События ---------- */
@@ -762,26 +1132,34 @@ document.querySelectorAll(".side-tab").forEach(b => b.onclick = () => {
   state.sel = null;
   layout(); renderAll(); renderCatalog();
 });
-$("btnCatalog").onclick = () => {
-  renderCatalog();
-  $("sheet").classList.remove("hidden"); $("scrim").classList.remove("hidden");
+
+$("btnPreview").onclick = () => {
+  state.preview = !state.preview;
+  document.body.classList.toggle("preview", state.preview);
+  $("btnPreview").classList.toggle("on", state.preview);
+  $("btnPreview").textContent = state.preview ? "Показать разметку" : "Как выглядит";
+  if (state.preview) state.sel = null;
+  renderAll(); haptic();
 };
-const closeSheet = () => { $("sheet").classList.add("hidden"); $("scrim").classList.add("hidden"); };
+
+$("btnCatalog").onclick = openSheet;
 $("btnCloseSheet").onclick = closeSheet;
 $("scrim").onclick = closeSheet;
+
+$("catSearch").oninput = (e) => { state.catQuery = e.target.value; renderCatalog(); };
+$("btnSort").onclick = () => {
+  state.catBySize = !state.catBySize;
+  $("btnSort").classList.toggle("on", state.catBySize);
+  $("btnSort").textContent = state.catBySize ? "по размеру ✓" : "по размеру";
+  renderCatalog();
+};
+
 $("btnRotate").onclick = () => {
   const p = state.placed.find(p => p.uid === state.sel); if (!p) return;
-  const next = (p.rotation + 90) % 360;
-  if (!fitsZone(p.s, p.side, next)) {
-    tg?.showAlert?.("Повёрнутым он в эту зону не влезет.");
-    return;
-  }
-  p.rotation = next; clamp(p); renderAll(); haptic();
+  p.rotation = normAngle(Math.round(p.rotation / 90) * 90 + 90);
+  clamp(p); renderAll(); haptic();
 };
-$("btnDelete").onclick = () => {
-  state.placed = state.placed.filter(p => p.uid !== state.sel);
-  state.sel = null; renderAll(); renderCatalog(); haptic();
-};
+$("btnDelete").onclick = removeSelected;
 $("btnOrder").onclick = openCheckout;
 $("coBack").onclick = closeCheckout;
 $("coSubmit").onclick = submitOrder;

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#faf9f6">
 <title>ÖMANKÖ — кастом-станция</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="styles.css">
@@ -12,7 +13,7 @@
 <div id="app">
   <header class="top">
     <div class="brand">ÖMANKÖ <span>custom station</span></div>
-    <div class="quota" id="quota"></div>
+    <button class="view-toggle" id="btnPreview" type="button">Как выглядит</button>
   </header>
 
   <section class="controls">
@@ -27,8 +28,9 @@
   <section class="stage-wrap">
     <!-- Сцену собирает layout(): фото бланка с зоной либо две схемы рукавов -->
     <div class="stage" id="stage"></div>
-    <div class="sel-tools hidden" id="selTools">
-      <button id="btnRotate" title="Повернуть">⟳ 90°</button>
+    <div class="tele" id="tele"></div>
+    <div class="sel-tools" id="selTools">
+      <button id="btnRotate" title="Повернуть на 90°">⟳ 90°</button>
       <button id="btnDelete" title="Убрать">✕ убрать</button>
     </div>
     <div class="hint" id="hint">Добавь принты из каталога и расставь их. Всё в реальном масштабе.</div>
@@ -42,9 +44,14 @@
 
   <!-- Каталог -->
   <div class="sheet hidden" id="sheet">
+    <div class="sheet-grab"></div>
     <div class="sheet-head">
       <div>Принты <span class="muted" id="sheetSide"></span></div>
       <button id="btnCloseSheet">✕</button>
+    </div>
+    <div class="sheet-filters">
+      <input id="catSearch" placeholder="Поиск по названию" autocomplete="off">
+      <button class="sort-btn" id="btnSort" type="button">по размеру</button>
     </div>
     <div class="sheet-grid" id="catalog"></div>
   </div>
@@ -81,7 +88,19 @@
 
   <!-- Экран успеха / просмотра -->
   <div class="overlay hidden" id="overlay"></div>
+
+  <!-- Тосты: подсказки и отмена действия -->
+  <div class="toasts" id="toasts"></div>
 </div>
+
+<!-- Скелет до ответа /api/config -->
+<div class="boot" id="boot">
+  <div class="sk row"></div>
+  <div class="sk tabs"></div>
+  <div class="sk stage"></div>
+  <div class="sk bar"></div>
+</div>
+
 <script src="app.js"></script>
 </body>
 </html>
