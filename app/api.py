@@ -280,6 +280,7 @@ async def create_order(body: NewOrder,
         raise HTTPException(409, str(e))
 
     pay_url = None
+    pay_error = None
     try:
         created = await payments.create_payment(order)
         if created:
@@ -287,18 +288,20 @@ async def create_order(body: NewOrder,
             db.set_payment_id(order["id"], payment_id)
             order["payment_id"] = payment_id
     except payments.PaymentError as e:
-        # Не роняем заказ: сотрудник сможет принять оплату руками.
+        # Не роняем заказ: сотрудник сможет принять оплату руками или
+        # перевыпустить ссылку кнопкой в карточке.
+        pay_error = str(e)
         log.error("Не удалось создать платёж по заказу №%s: %s", order["id"], e)
 
     # уведомления не должны валить создание заказа
-    asyncio.create_task(_notify_safe(order, pay_url))
+    asyncio.create_task(_notify_safe(order, pay_url, pay_error))
     return {"order_id": order["id"], "price": price,
             "delivery_price": order["delivery_price"], "pay_url": pay_url,
             "delivery_method": order["delivery_method"],
             "hold_minutes": config.ORDER_HOLD_MINUTES if pay_url else 0}
 
 
-async def _notify_safe(order: dict, pay_url: str | None):
+async def _notify_safe(order: dict, pay_url: str | None, pay_error: str | None = None):
     try:
         await tgbot.notify_customer_order_created(order, pay_url)
     except Exception as e:
@@ -307,6 +310,17 @@ async def _notify_safe(order: dict, pay_url: str | None):
         await tgbot.notify_staff_new_order(order)
     except Exception as e:
         log.warning("notify staff failed: %s", e)
+    # Про сломанную оплату сотрудники должны узнать сразу: покупатель уже
+    # сидит и ждёт ссылку, а в логи Railway никто не смотрит в это время.
+    if pay_error:
+        try:
+            await tgbot.alert_staff(
+                f"⚠️ Заказ №{order['id']}: ссылка на оплату не выпустилась.\n\n"
+                f"{pay_error}\n\n"
+                "Нажми «Выслать ссылку на оплату ↻» в карточке. Если не помогает — "
+                "команда /diag покажет, что не так с настройками.")
+        except Exception as e:
+            log.warning("alert staff failed: %s", e)
 
 
 @app.get("/api/orders/{oid}")
