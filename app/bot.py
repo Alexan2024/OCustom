@@ -130,6 +130,11 @@ async def diag(m: Message):
         lines.append(f"  SECRET_KEY: {_secret_state(config.YOOKASSA_SECRET_KEY)}")
         lines.append(f"  Чек 54-ФЗ: "
                      f"{'передаём' if config.YOOKASSA_SEND_RECEIPT else 'выключен'}")
+        if config.YOOKASSA_SEND_RECEIPT:
+            lines.append(f"  Ставка НДС: код {config.YOOKASSA_VAT_CODE}")
+            lines.append(f"  Способ расчёта: {config.YOOKASSA_PAYMENT_MODE}")
+            if config.YOOKASSA_PAYMENT_MODE not in ("full_payment", "full_prepayment"):
+                lines.append("  ❌ ЮKassa знает только full_payment и full_prepayment")
         try:
             shop = await payments.fetch_shop()
             lines.append(f"  ✅ магазин отвечает, статус «{shop.get('status')}»")
