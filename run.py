@@ -6,7 +6,7 @@ import uvicorn
 
 from app import cdek, config, db, jobs
 from app.api import app
-from app.bot import bot, dp
+from app.bot import bot, dp, setup_commands
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("start")
@@ -22,6 +22,9 @@ async def main():
         log.info("Бот: @%s", config.BOT_USERNAME)
     except Exception as e:
         log.warning("Не удалось узнать username бота: %s", e)
+
+    # Меню команд бота: «/start» и «/orders» (Мои заказы)
+    await setup_commands()
 
     log.info("Адрес мини-аппа: %s/webapp/", config.WEBAPP_URL)
     log.info("Режим оплаты: %s", config.PAYMENT_MODE)
@@ -52,6 +55,9 @@ async def main():
             log.warning("Подписка на статусы СДЭК не оформилась: %s", e)
     else:
         log.info("Доставка СДЭК выключена — только самовывоз")
+
+    log.info("Дневная квота заказов: %s",
+             config.ONLINE_QUOTA_PER_DAY if config.quota_enabled() else "выключена")
 
     if not config.STAFF_CHAT_ID:
         log.warning("STAFF_CHAT_ID не задан — заказы не будут приходить сотрудникам")
