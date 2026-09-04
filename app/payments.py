@@ -88,7 +88,7 @@ def build_receipt(order: dict) -> dict | None:
         "quantity": "1.00",
         "amount": {"value": _rub(config.BASE_PRICE), "currency": "RUB"},
         "vat_code": config.YOOKASSA_VAT_CODE,
-        "payment_mode": "full_payment",
+        "payment_mode": config.YOOKASSA_PAYMENT_MODE,
         "payment_subject": "commodity",
     }]
     extra = max(0, len(order["items"]) - config.INCLUDED_PRINTS)
@@ -98,7 +98,7 @@ def build_receipt(order: dict) -> dict | None:
             "quantity": f"{extra}.00",
             "amount": {"value": _rub(config.EXTRA_PRINT_PRICE), "currency": "RUB"},
             "vat_code": config.YOOKASSA_VAT_CODE,
-            "payment_mode": "full_payment",
+            "payment_mode": config.YOOKASSA_PAYMENT_MODE,
             "payment_subject": "commodity",
         })
     total = config.BASE_PRICE + extra * config.EXTRA_PRINT_PRICE
@@ -110,7 +110,7 @@ def build_receipt(order: dict) -> dict | None:
             "quantity": "1.00",
             "amount": {"value": _rub(delivery), "currency": "RUB"},
             "vat_code": config.YOOKASSA_VAT_CODE,
-            "payment_mode": "full_payment",
+            "payment_mode": config.YOOKASSA_PAYMENT_MODE,
             "payment_subject": "service",
         })
         total += delivery
