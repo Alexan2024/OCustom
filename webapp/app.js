@@ -21,8 +21,8 @@ tg?.ready(); tg?.expand();
    с touchmove ниже. */
 tg?.disableVerticalSwipes?.();
 /* Шапка Telegram своего цвета оставляла шов над мини-аппом. */
-try { tg?.setHeaderColor?.("#faf9f6"); } catch (e) { /* старый клиент */ }
-try { tg?.setBackgroundColor?.("#faf9f6"); } catch (e) { /* старый клиент */ }
+try { tg?.setHeaderColor?.("#efefef"); } catch (e) { /* старый клиент */ }
+try { tg?.setBackgroundColor?.("#efefef"); } catch (e) { /* старый клиент */ }
 
 const $ = (id) => document.getElementById(id);
 const SLEEVES = ["sleeve_l", "sleeve_r"];
@@ -714,12 +714,10 @@ function addSticker(s) {
   state.placed.push(p);
   state.sel = p.uid;
   markGone();
-  // Лист не закрываем: чаще всего принтов кладут несколько подряд.
+  // Лист закрываем сразу: человек должен увидеть, куда лёг принт.
+  closeSheet();
   renderAll(); renderCatalog(); renderSizes(); haptic();
-  toast(`«${s.name}» на ${SIDE_NAMES[side]}`, {
-    ms: 2000,
-    action: { label: "Готово", fn: closeSheet },
-  });
+  toast(`«${s.name}» на ${SIDE_NAMES[side]}`, { ms: 2000 });
 }
 
 function removeSelected() {
