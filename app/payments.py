@@ -16,6 +16,10 @@ GET /v3/payments/{id} и сверяем статус и сумму. Поддел
 чек уйдёт в никуда, позже — магазин начнёт отклонять платежи без чека.
 Доставка в чеке идёт отдельной строкой как услуга — иначе сумма позиций
 не сойдётся с суммой платежа, и ЮKassa откажет.
+
+В чеке обязательно едет система налогообложения (tax_system_code, на стороне
+кассы — sno). Без неё Атол отбивает весь чек ошибкой валидации, а платёж
+падает с httpStatus=400. У ÖMANKÖ — УСН «Доходы», код 2.
 """
 import logging
 import re
@@ -77,6 +81,25 @@ def goods_price(order: dict) -> int:
     return int(order["price"]) - int(order.get("delivery_price") or 0)
 
 
+def tax_system_code() -> int | None:
+    """Система налогообложения для чека. None — не передавать поле.
+
+    Касса требует его почти всегда: без sno Атол возвращает
+    «Ошибка валидации входящего чека … Required properties ["sno"]».
+    Не передаём, только если YOOKASSA_TAX_SYSTEM_CODE=0 — то есть в кассе
+    зарегистрирована ровно одна СНО и она подставляется сама.
+    """
+    code = config.YOOKASSA_TAX_SYSTEM_CODE
+    if code == 0:
+        return None
+    if not 1 <= code <= 6:
+        raise PaymentError(
+            f"YOOKASSA_TAX_SYSTEM_CODE={code} — такого кода СНО не бывает. "
+            "Допустимы 1–6 (у нас УСН «Доходы» = 2), либо 0, чтобы не "
+            "передавать поле вовсе.")
+    return code
+
+
 def build_receipt(order: dict) -> dict | None:
     """Состав чека. Позиции обязаны в сумме давать цену заказа."""
     phone = normalize_phone(order.get("phone"))
@@ -118,7 +141,12 @@ def build_receipt(order: dict) -> dict | None:
     if total != order["price"]:
         raise PaymentError(
             f"Чек не сходится с заказом: {total} ≠ {order['price']} ₽")
-    return {"customer": {"phone": phone}, "items": items}
+
+    receipt = {"customer": {"phone": phone}, "items": items}
+    sno = tax_system_code()
+    if sno is not None:
+        receipt["tax_system_code"] = sno
+    return receipt
 
 
 async def fetch_shop() -> dict:
