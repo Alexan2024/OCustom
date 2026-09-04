@@ -255,10 +255,13 @@ body.preview .sticker { outline: none !important; }
   transition: border-color .16s var(--ease), transform .12s var(--ease);
 }
 .cat-item:active { transform: scale(.97); }
+/* Превью одинаковой величины: картинка вписывается в общую рамку */
 .cat-item .ph {
-  height: 76px; display: flex; align-items: flex-end; justify-content: center;
+  height: 78px; display: flex; align-items: center; justify-content: center;
 }
-.cat-item img { max-width: 100%; object-fit: contain; display: block; }
+.cat-item img {
+  width: 100%; height: 78px; object-fit: contain; display: block;
+}
 .cat-item .nm { font-size: 12px; margin-top: 6px; }
 .cat-item .sz { font-family: var(--mono); font-size: 10px; color: var(--muted); }
 /* Разобрали: бледнее и штамп поверх */
