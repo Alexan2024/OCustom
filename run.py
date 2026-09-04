@@ -36,10 +36,15 @@ async def main():
 
     if cdek.enabled():
         log.info("Доставка СДЭК включена (%s)",
-                 "песочница" if config.CDEK_TEST else "боевой контур")
+                 "ПЕСОЧНИЦА, настоящих посылок не будет" if config.CDEK_TEST
+                 else "боевой контур")
+        if not config.CDEK_TEST and not (config.CDEK_ACCOUNT and config.CDEK_PASSWORD):
+            log.error("DELIVERY_CDEK=true и CDEK_TEST=false, но не заданы "
+                      "CDEK_ACCOUNT / CDEK_PASSWORD — доставка считаться не будет")
+        log.info("Отправляем из ПВЗ %s (город %s)",
+                 config.CDEK_SHIPMENT_POINT or "— не задан!", config.CDEK_FROM_CITY_CODE)
         if not config.CDEK_SHIPMENT_POINT:
-            log.error("DELIVERY_CDEK=true, но не задан CDEK_SHIPMENT_POINT — "
-                      "накладные создаваться не будут")
+            log.error("Не задан CDEK_SHIPMENT_POINT — накладные создаваться не будут")
         log.info("Адрес для уведомлений СДЭК: %s", cdek.webhook_url())
         try:
             await cdek.ensure_webhook()
