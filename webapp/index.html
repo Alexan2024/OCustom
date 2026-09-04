@@ -50,6 +50,35 @@
   </div>
   <div class="scrim hidden" id="scrim"></div>
 
+  <!-- Оформление: способ получения, получатель, доставка -->
+  <div class="overlay full hidden" id="checkout">
+    <div class="pane">
+      <div class="pane-head">
+        <button class="pane-back" id="coBack">←</button>
+        <div class="pane-title">Оформление</div>
+        <div class="pane-side" id="coGoods"></div>
+      </div>
+      <div class="pane-body" id="coBody"></div>
+      <div class="pane-foot">
+        <div class="pane-total" id="coTotal"></div>
+        <button class="order-btn" id="coSubmit">Оформить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Общий выбиральщик: города и пункты выдачи -->
+  <div class="overlay full hidden" id="pick">
+    <div class="pane">
+      <div class="pane-head">
+        <button class="pane-back" id="pickBack">←</button>
+        <div class="pane-title" id="pickTitle"></div>
+        <div class="pane-side"></div>
+      </div>
+      <div class="pane-search"><input id="pickInput" autocomplete="off"></div>
+      <div class="pane-body" id="pickList"></div>
+    </div>
+  </div>
+
   <!-- Экран успеха / просмотра -->
   <div class="overlay hidden" id="overlay"></div>
 </div>
