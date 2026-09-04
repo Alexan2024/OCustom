@@ -1,17 +1,22 @@
 """Фоновые задачи.
 
-Пока одна: неоплаченные заказы не должны вечно держать принты в резерве.
+Первая: неоплаченные заказы не должны вечно держать принты в резерве.
 DTF-переносы — физические остатки, каждый брошенный заказ прячет от других
 покупателей реальную наклейку, которая лежит на складе.
+
+Вторая: доопрос накладных СДЭК. Вебхук — основной путь, но он может
+потеряться, и человек останется без трек-номера. Раз в десять минут
+проходим по активным отправлениям и спрашиваем СДЭК сами.
 """
 import asyncio
 import logging
 
-from . import bot as tgbot, config, db, payments
+from . import bot as tgbot, cdek, config, db, payments
 
 log = logging.getLogger("jobs")
 
 CHECK_EVERY_SEC = 120
+SHIPMENTS_EVERY_SEC = 600
 
 
 async def expire_unpaid_orders_loop():
@@ -53,3 +58,20 @@ async def _tick():
             log.info("Заказ №%s отменён по таймауту, принты вернулись в остатки", oid)
             await tgbot.notify_customer_status(order, "expired")
             await tgbot.refresh_or_send_staff_card(order)
+
+
+async def sync_shipments_loop():
+    """Страховка на случай потерянного уведомления от СДЭК."""
+    while True:
+        await asyncio.sleep(SHIPMENTS_EVERY_SEC)
+        if not cdek.enabled():
+            continue
+        try:
+            for oid in db.active_shipments():
+                try:
+                    await tgbot.sync_shipment(oid)
+                except Exception as e:
+                    log.warning("Не смог обновить накладную по заказу №%s: %s", oid, e)
+                await asyncio.sleep(1)   # не долбим СДЭК очередью
+        except Exception as e:
+            log.warning("Проверка накладных упала: %s", e)
