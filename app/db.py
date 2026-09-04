@@ -32,10 +32,23 @@ CREATE TABLE IF NOT EXISTS orders (
     first_name TEXT,
     phone TEXT,                  -- телефон покупателя (нужен для чека по 54-ФЗ)
     size TEXT NOT NULL,
-    price INTEGER NOT NULL,
+    price INTEGER NOT NULL,      -- итог: товар + доставка
     status TEXT NOT NULL DEFAULT 'new',
-    -- new → paid → in_progress → ready → done | cancelled
+    -- new → paid → in_progress → ready → [shipped] → done | cancelled
     payment_id TEXT,             -- id платежа в ЮKassa
+    -- Доставка
+    delivery_method TEXT NOT NULL DEFAULT 'pickup',  -- pickup | cdek_pvz | cdek_door
+    delivery_price INTEGER NOT NULL DEFAULT 0,
+    recipient_name TEXT,
+    city_code INTEGER,
+    city_name TEXT,
+    pvz_code TEXT,
+    pvz_address TEXT,
+    address TEXT,                -- адрес для курьера
+    cdek_uuid TEXT,              -- накладная в СДЭК
+    cdek_number TEXT,            -- трек-номер
+    cdek_status TEXT,
+    cdek_status_text TEXT,
     view_token TEXT NOT NULL,    -- для просмотра раскладки сотрудником по ссылке
     staff_msg_id INTEGER,        -- id карточки в чате сотрудников
     created_at TEXT NOT NULL DEFAULT ({NOW_SQL})
@@ -43,7 +56,7 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE TABLE IF NOT EXISTS order_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL REFERENCES orders(id),
-    side TEXT NOT NULL,          -- front | back
+    side TEXT NOT NULL,          -- front | back | sleeve_l | sleeve_r
     sticker_id INTEGER NOT NULL REFERENCES stickers(id),
     x_mm REAL NOT NULL,          -- центр стикера: смещение от вертикальной оси (+ вправо)
     y_mm REAL NOT NULL,          -- центр стикера: от верха печатной зоны
@@ -55,6 +68,24 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TEXT NOT NULL DEFAULT ({NOW_SQL})
 );
 """
+
+# Колонки, которые могли появиться позже схемы. Порядок важен только для лога.
+LATE_COLUMNS = (
+    ("phone", "TEXT"),
+    ("payment_id", "TEXT"),
+    ("delivery_method", "TEXT NOT NULL DEFAULT 'pickup'"),
+    ("delivery_price", "INTEGER NOT NULL DEFAULT 0"),
+    ("recipient_name", "TEXT"),
+    ("city_code", "INTEGER"),
+    ("city_name", "TEXT"),
+    ("pvz_code", "TEXT"),
+    ("pvz_address", "TEXT"),
+    ("address", "TEXT"),
+    ("cdek_uuid", "TEXT"),
+    ("cdek_number", "TEXT"),
+    ("cdek_status", "TEXT"),
+    ("cdek_status_text", "TEXT"),
+)
 
 
 @contextmanager
@@ -97,7 +128,7 @@ def _migrate():
     """Добавляет колонки, которых нет в уже развёрнутой базе."""
     with conn() as c:
         cols = {r["name"] for r in c.execute("PRAGMA table_info(orders)")}
-        for name, ddl in (("phone", "TEXT"), ("payment_id", "TEXT")):
+        for name, ddl in LATE_COLUMNS:
             if name not in cols:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
                 log.info("Миграция: добавлена колонка orders.%s", name)
@@ -240,9 +271,20 @@ class OrderError(Exception):
     pass
 
 
-def create_order(user, size: str, items: list, price: int, phone: str | None = None) -> dict:
+def create_order(user, size: str, items: list, price: int,
+                 phone: str | None = None, delivery: dict | None = None) -> dict:
     """items: [{side, sticker_id, x_mm, y_mm, rotation}, ...]
-    Резервирует остатки стикеров атомарно."""
+
+    delivery: {method, price, recipient_name, city_code, city_name,
+               pvz_code, pvz_address, address} — для самовывоза достаточно
+    {"method": "pickup"}.
+
+    Резервирует остатки стикеров атомарно.
+    """
+    d = dict(delivery or {})
+    d.setdefault("method", "pickup")
+    d.setdefault("price", 0)
+
     today = now_local().strftime("%Y-%m-%d")
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -270,9 +312,15 @@ def create_order(user, size: str, items: list, price: int, phone: str | None = N
         # в UTC, и заказ рождался «на три часа старше», чем есть.
         cur = c.execute(
             "INSERT INTO orders (user_id, username, first_name, phone, size, price,"
-            " view_token, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            " delivery_method, delivery_price, recipient_name, city_code, city_name,"
+            " pvz_code, pvz_address, address, view_token, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (user["id"], user.get("username"), user.get("first_name"),
-             phone, size, price, secrets.token_urlsafe(8), stamp(now_local())),
+             phone, size, price,
+             d["method"], int(d.get("price") or 0), d.get("recipient_name"),
+             d.get("city_code"), d.get("city_name"), d.get("pvz_code"),
+             d.get("pvz_address"), d.get("address"),
+             secrets.token_urlsafe(8), stamp(now_local())),
         )
         oid = cur.lastrowid
         for it in items:
@@ -368,3 +416,57 @@ def expired_unpaid(minutes: int) -> list[dict]:
 def set_staff_msg(oid: int, msg_id: int):
     with conn() as c:
         c.execute("UPDATE orders SET staff_msg_id=? WHERE id=?", (msg_id, oid))
+
+
+# ---------- Доставка ----------
+
+def set_cdek_uuid(oid: int, uuid: str) -> bool:
+    """Ставит uuid накладной, если его ещё нет. False — накладная уже была
+    (две параллельные попытки не создадут вторую посылку)."""
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute(
+            "UPDATE orders SET cdek_uuid=? WHERE id=? AND (cdek_uuid IS NULL OR cdek_uuid='')",
+            (uuid, oid),
+        )
+        return cur.rowcount == 1
+
+
+def set_cdek_state(oid: int, number: str | None, status: str | None,
+                   text: str | None) -> bool:
+    """Обновляет трек и статус. True, если что-то реально изменилось —
+    по этому флагу решаем, дёргать ли клиента и перерисовывать ли карточку."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT cdek_number, cdek_status FROM orders WHERE id=?", (oid,)
+        ).fetchone()
+        if not row:
+            return False
+        changed = ((number and number != (row["cdek_number"] or ""))
+                   or (status and status != (row["cdek_status"] or "")))
+        if not changed:
+            return False
+        c.execute(
+            "UPDATE orders SET cdek_number=COALESCE(NULLIF(?,''), cdek_number),"
+            " cdek_status=COALESCE(NULLIF(?,''), cdek_status),"
+            " cdek_status_text=COALESCE(NULLIF(?,''), cdek_status_text) WHERE id=?",
+            (number or "", status or "", text or "", oid),
+        )
+        return True
+
+
+def order_by_cdek_uuid(uuid: str) -> dict | None:
+    with conn() as c:
+        row = c.execute("SELECT id FROM orders WHERE cdek_uuid=?", (uuid,)).fetchone()
+    return get_order(row["id"]) if row else None
+
+
+def active_shipments() -> list[int]:
+    """Заказы, за накладными которых ещё стоит следить."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id FROM orders WHERE delivery_method!='pickup' "
+            "AND cdek_uuid IS NOT NULL AND cdek_uuid!='' "
+            "AND status IN ('ready','shipped')"
+        ).fetchall()
+    return [r["id"] for r in rows]
