@@ -90,16 +90,22 @@ PICKUP_TEXT = os.getenv(
 DELIVERY_METHODS = ("pickup", "cdek_pvz", "cdek_door")
 DELIVERY_CDEK = _flag("DELIVERY_CDEK", "false")
 
-# Боевой контур или песочница. В песочнице реквизиты подставляются сами,
-# заводить ничего не нужно — можно щёлкать заказы, пока договор не подписан.
-CDEK_TEST = _flag("CDEK_TEST", "true")
-CDEK_ACCOUNT = _env("CDEK_ACCOUNT", "")       # Идентификатор клиента из ЛК СДЭК
-CDEK_PASSWORD = _env("CDEK_PASSWORD", "")     # Секретный ключ из ЛК СДЭК
+# Боевой контур или песочница. По умолчанию боевой: реквизиты живут
+# в переменных Railway, и молча уехать в песочницу с ними нельзя.
+# CDEK_TEST=true — контур api.edu.cdek.ru, реквизиты подставляются сами,
+# договор не нужен, заказы настоящими посылками не становятся.
+CDEK_TEST = _flag("CDEK_TEST", "false")
+CDEK_ACCOUNT = _env("CDEK_ACCOUNT", "")       # Account из ЛК СДЭК → Интеграция
+CDEK_PASSWORD = _env("CDEK_PASSWORD", "")     # Secure password оттуда же
+# Ключи в код не кладём: они дают право создавать отправления от лица магазина.
+# Договор «Интернет-магазин» — ИМ-РФ-ММР-50. В API он не передаётся: тарифы
+# 136/137 открыты на самом аккаунте. Номер тут только чтобы не потерялся.
 
 # Откуда уезжает посылка. Схема одна: сотрудник относит пакет в свой ПВЗ,
 # дальше СДЭК везёт его получателю. Забор курьером от поп-апа не используется —
 # его надо заказывать заранее, а поп-ап работает не по складскому расписанию.
-CDEK_SHIPMENT_POINT = _env("CDEK_SHIPMENT_POINT", "")   # код ПВЗ, куда сдаём посылки
+# MSK537 — Москва, 2-й Хвостов переулок, 12. Пн-Пт 10:00-21:00, Сб-Вс 10:00-20:00.
+CDEK_SHIPMENT_POINT = _env("CDEK_SHIPMENT_POINT", "MSK537")
 CDEK_FROM_CITY_CODE = int(_env("CDEK_FROM_CITY_CODE", "44"))  # 44 = Москва
 
 # Тарифы для договора «Интернет-магазин»:
@@ -114,12 +120,14 @@ CDEK_SENDER_PHONE = _env("CDEK_SENDER_PHONE", "")
 # договора, а «42» слишком легко пересечётся с чем-нибудь ещё.
 CDEK_ORDER_PREFIX = _env("CDEK_ORDER_PREFIX", "omanko")
 
-# Габариты посылки. Футболка в пакете: считаем один размер на все заказы —
-# разброс по весу в пределах погрешности тарифа.
-PACKAGE_WEIGHT_G = int(_env("PACKAGE_WEIGHT_G", "350"))
-PACKAGE_LENGTH_CM = int(_env("PACKAGE_LENGTH_CM", "25"))
-PACKAGE_WIDTH_CM = int(_env("PACKAGE_WIDTH_CM", "20"))
-PACKAGE_HEIGHT_CM = int(_env("PACKAGE_HEIGHT_CM", "6"))
+# Габариты посылки: замер Паши, футболка в пакете 40×35×3 см, 500 г.
+# Считаем один размер на все заказы — разброс между S и XL тариф не двигает.
+# Проверено на боевых тарифах: цена от габаритов в этом диапазоне не зависит
+# вообще (договор считает по направлению), так что ужимать пакет смысла нет.
+PACKAGE_WEIGHT_G = int(_env("PACKAGE_WEIGHT_G", "500"))
+PACKAGE_LENGTH_CM = int(_env("PACKAGE_LENGTH_CM", "40"))
+PACKAGE_WIDTH_CM = int(_env("PACKAGE_WIDTH_CM", "35"))
+PACKAGE_HEIGHT_CM = int(_env("PACKAGE_HEIGHT_CM", "3"))
 
 # Наценка на тариф СДЭК, ₽ (упаковка, время сотрудника). 0 — продаём в ноль.
 DELIVERY_MARKUP_RUB = int(_env("DELIVERY_MARKUP_RUB", "0"))
