@@ -121,6 +121,36 @@ def build_receipt(order: dict) -> dict | None:
     return {"customer": {"phone": phone}, "items": items}
 
 
+async def fetch_shop() -> dict:
+    """GET /v3/me — что ЮKassa думает про наш магазин.
+
+    Тут видно главное: включена ли фискализация. Как только касса подключена,
+    ЮKassa начинает отклонять платежи без состава чека, и признак приезжает
+    именно отсюда. Ключ заодно проверяется на живость: неверный даст 401.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.get(f"{API_URL}/me", auth=_auth())
+    except httpx.HTTPError as e:
+        raise PaymentError(f"ЮKassa недоступна: {e}") from e
+    if r.status_code == 401:
+        raise PaymentError("ЮKassa не приняла ключ (401). Проверь "
+                           "YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY")
+    if r.status_code >= 400:
+        raise PaymentError(f"ЮKassa вернула {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def fiscalization_on(shop: dict) -> bool | None:
+    """Признак живёт в двух местах — в разных версиях API по-разному."""
+    f = shop.get("fiscalization")
+    if isinstance(f, dict) and "enabled" in f:
+        return bool(f["enabled"])
+    if "fiscalization_enabled" in shop:
+        return bool(shop["fiscalization_enabled"])
+    return None
+
+
 async def create_payment(order: dict, attempt: int = 1) -> tuple[str, str] | None:
     """Создаёт платёж. Возвращает (ссылка на оплату, id платежа) или None
     в ручном режиме."""
