@@ -17,8 +17,8 @@ from . import config
 
 log = logging.getLogger("render")
 
-PAPER = (250, 249, 246, 255)
-LINE = (207, 203, 192, 255)
+PAPER = (239, 239, 239, 255)
+LINE = (209, 209, 209, 255)
 MUTED = (134, 130, 122, 255)
 INK = (23, 22, 19, 255)
 
