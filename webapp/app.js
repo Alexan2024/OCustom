@@ -677,18 +677,14 @@ function renderCatalog() {
     return;
   }
 
-  // Превью в общем масштабе: крупный принт и выглядит крупнее мелкого
-  const maxW = Math.max(...list.map(s => s.width_mm));
-  const maxH = Math.max(...list.map(s => s.height_mm));
-  const k = Math.min(88 / maxW, 72 / maxH);
-
+  // В каталоге все превью одной величины: мелкий принт иначе не разглядеть.
+  // Настоящий размер подписан миллиметрами и виден на футболке после нажатия.
   for (const s of list) {
     const left = (s.stock == null ? Infinity : s.stock) - usedCount(s.id);
     const out = left <= 0;
     const d = document.createElement("div");
     d.className = "cat-item" + (out ? " out" : "");
-    d.innerHTML = `<div class="ph"><img src="/stickers/${s.file}"
-        style="width:${Math.max(10, s.width_mm * k)}px;height:${Math.max(10, s.height_mm * k)}px"></div>
+    d.innerHTML = `<div class="ph"><img src="/stickers/${s.file}" alt=""></div>
       <div class="nm">${s.name}</div>
       <div class="sz">${s.width_mm}×${s.height_mm} мм</div>
       ${out ? '<div class="soldout">SOLD OUT</div>' : ""}`;
