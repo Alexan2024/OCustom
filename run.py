@@ -4,7 +4,7 @@ import logging
 
 import uvicorn
 
-from app import config, db, jobs
+from app import cdek, config, db, jobs
 from app.api import app
 from app.bot import bot, dp
 
@@ -33,6 +33,21 @@ async def main():
                  config.WEBAPP_URL)
         log.info("Чек по 54-ФЗ: %s",
                  "передаётся" if config.YOOKASSA_SEND_RECEIPT else "выключен")
+
+    if cdek.enabled():
+        log.info("Доставка СДЭК включена (%s)",
+                 "песочница" if config.CDEK_TEST else "боевой контур")
+        if not config.CDEK_SHIPMENT_POINT:
+            log.error("DELIVERY_CDEK=true, но не задан CDEK_SHIPMENT_POINT — "
+                      "накладные создаваться не будут")
+        log.info("Адрес для уведомлений СДЭК: %s", cdek.webhook_url())
+        try:
+            await cdek.ensure_webhook()
+        except Exception as e:
+            log.warning("Подписка на статусы СДЭК не оформилась: %s", e)
+    else:
+        log.info("Доставка СДЭК выключена — только самовывоз")
+
     if not config.STAFF_CHAT_ID:
         log.warning("STAFF_CHAT_ID не задан — заказы не будут приходить сотрудникам")
 
@@ -43,6 +58,7 @@ async def main():
         server.serve(),
         dp.start_polling(bot),
         jobs.expire_unpaid_orders_loop(),
+        jobs.sync_shipments_loop(),
     )
 
 
