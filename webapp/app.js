@@ -30,6 +30,7 @@ const SIDE_NAMES = {
   front: "перед", back: "спина",
   sleeve_l: "левый рукав", sleeve_r: "правый рукав",
 };
+const SIDE_SHORT = { front: "пер", back: "спн", sleeve_l: "лев", sleeve_r: "прв" };
 const SLEEVE_SPLIT_MM = 60;   // просвет между схемами рукавов на экране
 const SNAP_DEG = 5;           // магнит поворота к 0/90/180/270
 const STOCK_POLL_MS = 45000;  // как часто переспрашиваем остатки
@@ -308,7 +309,11 @@ function layout() {
   const stage = $("stage");
   stage.innerHTML = "";
   state.zoneEls = {};
-  const availW = stage.clientWidth - 24, availH = stage.clientHeight - 16;
+  // Список принтов занимает полосу справа — сцена должна её учесть
+  const withLayers = !state.preview && state.placed.length > 0;
+  document.body.classList.toggle("has-layers", withLayers);
+  const availW = stage.clientWidth - 24 - (withLayers ? 56 : 0);
+  const availH = stage.clientHeight - 16;
   if (availW <= 0 || availH <= 0) return;
   if (state.view === "sleeves") layoutSleeves(availW, availH);
   else layoutBody(availW, availH);
@@ -452,6 +457,58 @@ function renderAll() {
   refreshFlags();
 }
 
+/* Список положенных принтов. Принт, оказавшийся под соседом, пальцем
+   на футболке уже не подцепить — берём его отсюда. */
+let layersSig = null;
+
+function renderLayers() {
+  const box = $("layers");
+  if (state.preview || !state.placed.length) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    layersSig = null;
+    return;
+  }
+  // refreshFlags дёргается на каждом кадре перетаскивания — пересобираем
+  // список, только когда он реально изменился
+  const sig = state.placed.map(p => `${p.uid}:${p.side}`).join("|")
+    + `#${state.sel}#${[...state.gone].join(",")}`;
+  box.classList.remove("hidden");
+  if (sig === layersSig) return;
+  layersSig = sig;
+  box.innerHTML = "";
+  for (const p of state.placed) {
+    const d = document.createElement("div");
+    d.className = "layer"
+      + (state.sel === p.uid ? " active" : "")
+      + (state.gone.has(p.s.id) ? " bad" : "");
+    d.innerHTML = `<img src="/stickers/${p.s.file}" draggable="false">
+      <div class="tag">${SIDE_SHORT[p.side]}</div>`;
+    d.title = `${p.s.name} · ${p.s.width_mm}×${p.s.height_mm} мм`;
+    d.onclick = () => selectPlaced(p.uid);
+    box.appendChild(d);
+  }
+}
+
+/* Выбор принта из списка: при необходимости переключаем и вкладку стороны */
+function selectPlaced(uid) {
+  const p = state.placed.find(x => x.uid === uid);
+  if (!p) return;
+  const view = p.side.startsWith("sleeve") ? "sleeves" : p.side;
+  state.sel = uid;
+  state.target = p.side;
+  if (state.view !== view) setView(view);
+  else layoutRefresh();
+  haptic();
+}
+
+function setView(v) {
+  state.view = v;
+  document.querySelectorAll(".side-tab").forEach(x =>
+    x.classList.toggle("active", x.dataset.view === v));
+  layout(); renderAll(); renderCatalog();
+}
+
 function place(el, p) {
   const z = zoneOf(p.side);
   el.style.left = (z.w_mm / 2 + p.x_mm) * state.ppm + "px";
@@ -474,6 +531,7 @@ function refreshFlags() {
   });
   $("selTools").classList.toggle("on", state.sel != null && !state.viewMode && !state.preview);
   updateTele();
+  renderLayers();
 
   const hint = $("hint");
   if (state.viewMode) { /* подпись в режиме просмотра ставится один раз */ }
@@ -1119,12 +1177,9 @@ function showSuccess(data) {
 /* ---------- События ---------- */
 
 document.querySelectorAll(".side-tab").forEach(b => b.onclick = () => {
-  document.querySelectorAll(".side-tab").forEach(x => x.classList.remove("active"));
-  b.classList.add("active");
-  state.view = b.dataset.view;
-  state.target = state.view === "sleeves" ? "sleeve_l" : state.view;
+  state.target = b.dataset.view === "sleeves" ? "sleeve_l" : b.dataset.view;
   state.sel = null;
-  layout(); renderAll(); renderCatalog();
+  setView(b.dataset.view);
 });
 
 $("btnPreview").onclick = () => {
@@ -1133,7 +1188,7 @@ $("btnPreview").onclick = () => {
   $("btnPreview").classList.toggle("on", state.preview);
   $("btnPreview").textContent = state.preview ? "Показать разметку" : "Как выглядит";
   if (state.preview) state.sel = null;
-  renderAll(); haptic();
+  layout(); renderAll(); haptic();
 };
 
 $("btnCatalog").onclick = openSheet;
