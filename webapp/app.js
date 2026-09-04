@@ -3,7 +3,11 @@
    Координаты хранятся в мм: x — смещение центра стикера от вертикальной оси
    зоны (+ вправо), y — от верхнего края зоны до центра стикера.
    На рукаве та же пара означает другое: x идёт вокруг руки (+ к спине),
-   y — вниз от проймы. Сторон четыре: front, back, sleeve_l, sleeve_r. */
+   y — вниз от проймы. Сторон четыре: front, back, sleeve_l, sleeve_r.
+
+   Второй экран — оформление: способ получения, получатель, доставка.
+   Цену доставки здесь только показываем; при создании заказа сервер
+   пересчитывает её сам и в спорной ситуации побеждает он. */
 
 const tg = window.Telegram?.WebApp;
 tg?.ready(); tg?.expand();
@@ -21,6 +25,12 @@ const SIDE_NAMES = {
 };
 const SLEEVE_SPLIT_MM = 60;   // просвет между схемами рукавов на экране
 
+const METHOD_NAMES = {
+  pickup: "Самовывоз",
+  cdek_pvz: "СДЭК, пункт выдачи",
+  cdek_door: "СДЭК, курьер до двери",
+};
+
 const state = {
   cfg: null, stickers: [],
   size: null,
@@ -32,9 +42,18 @@ const state = {
   zoneEls: {},         // side -> DOM-узел зоны, живёт до следующего layout()
   viewMode: false,
   uidSeq: 1,
+  delivery: {
+    method: "pickup",
+    name: "", phone: "",
+    city: null,        // {code, city, region}
+    point: null,       // {code, address, work_time}
+    address: "",
+    price: 0, period: "", calcing: false, error: "",
+  },
 };
 
 const haptic = (t = "light") => tg?.HapticFeedback?.impactOccurred?.(t);
+const initHeaders = () => ({ "X-Telegram-Init-Data": tg?.initData || "" });
 
 /* ---------- Загрузка ---------- */
 
@@ -51,6 +70,18 @@ async function boot() {
   $("quota").textContent = cfg.quota_left > 0
     ? `сегодня осталось мест: ${cfg.quota_left}` : "на сегодня мест нет";
   renderSizes(); renderCatalog(); layout(); renderAll(); updateBar();
+
+  // Имя и телефон, если человек их уже давал — чтобы не вводил заново
+  if (cfg.delivery?.cdek) {
+    fetch("/api/me", { headers: initHeaders() })
+      .then(r => r.ok ? r.json() : null)
+      .then(me => {
+        if (!me) return;
+        state.delivery.name = state.delivery.name || me.name || "";
+        state.delivery.phone = state.delivery.phone || me.phone || "";
+      })
+      .catch(() => {});
+  }
 }
 
 async function bootView(oid, key) {
@@ -364,57 +395,361 @@ function addSticker(s) {
   closeSheet(); renderAll(); renderCatalog(); haptic();
 }
 
-/* ---------- Панель, цена, заказ ---------- */
+/* ---------- Панель и цена ---------- */
 
-function price() {
+function goodsPrice() {
   const n = state.placed.length;
   const extra = Math.max(0, n - state.cfg.included_prints);
   return state.cfg.base_price + extra * state.cfg.extra_print_price;
 }
 
+function totalPrice() { return goodsPrice() + (state.delivery.price || 0); }
+
 function updateBar() {
   const n = state.placed.length, c = state.cfg;
   $("price").innerHTML = n
-    ? `${price()} ₽<small>${n} принт(а) · ${c.included_prints} включено</small>`
+    ? `${goodsPrice()} ₽<small>${n} принт(а) · ${c.included_prints} включено</small>`
     : `${c.base_price} ₽<small>${c.included_prints} принта включено</small>`;
   $("btnOrder").disabled = n === 0 || anyTooClose() || c.quota_left <= 0;
 }
 
+/* ---------- Оформление ---------- */
+
+function openCheckout() {
+  // Пока доставка выключена, второй экран не нужен: способ получения один.
+  if (!state.cfg.delivery?.cdek) return submitOrder();
+  $("checkout").classList.remove("hidden");
+  renderCheckout();
+}
+
+function closeCheckout() { $("checkout").classList.add("hidden"); }
+
+function setMethod(m) {
+  if (state.delivery.method === m) return;
+  state.delivery.method = m;
+  state.delivery.price = 0; state.delivery.period = ""; state.delivery.error = "";
+  renderCheckout();
+  if (m !== "pickup" && state.delivery.city) recalcDelivery();
+  haptic();
+}
+
+function renderCheckout() {
+  const d = state.delivery;
+  $("coGoods").textContent = `товар ${goodsPrice()} ₽`;
+  const body = $("coBody");
+  body.innerHTML = "";
+
+  // способ получения
+  const g1 = document.createElement("div");
+  g1.className = "co-group";
+  g1.innerHTML = '<div class="co-label">Как получишь</div>';
+  const methods = document.createElement("div");
+  methods.className = "co-methods";
+  const opts = [
+    ["pickup", "Самовывоз", "Бесплатно, в поп-апе"],
+    ["cdek_pvz", "СДЭК, пункт выдачи", "Заберёшь в ближайшем ПВЗ"],
+    ["cdek_door", "СДЭК, курьер", "Привезут по адресу"],
+  ];
+  for (const [m, title, sub] of opts) {
+    const b = document.createElement("button");
+    b.className = "co-method" + (d.method === m ? " active" : "");
+    b.innerHTML = `<div>${title}</div><small>${sub}</small>`;
+    b.onclick = () => setMethod(m);
+    methods.appendChild(b);
+  }
+  g1.appendChild(methods);
+  body.appendChild(g1);
+
+  if (d.method === "pickup") {
+    const g = document.createElement("div");
+    g.className = "co-group";
+    g.innerHTML = `<div class="co-label">Где забрать</div>
+      <div class="co-note">${state.cfg.pickup_text}<br><br>
+      Назови номер заказа на кассе. Храним ${state.cfg.pickup_hold_days} дней.</div>`;
+    body.appendChild(g);
+  } else {
+    const g = document.createElement("div");
+    g.className = "co-group";
+    g.innerHTML = '<div class="co-label">Получатель</div>';
+
+    const fName = field("text", "Имя и фамилия", d.name, v => { d.name = v; updateCheckoutInfo(); });
+    const fPhone = field("tel", "+7 900 123-45-67", d.phone, v => { d.phone = v; updateCheckoutInfo(); });
+    g.appendChild(fName); g.appendChild(fPhone);
+
+    const city = document.createElement("button");
+    city.className = "co-pickbtn"; city.id = "coCity";
+    city.onclick = openCityPicker;
+    g.appendChild(wrapField(city));
+
+    if (d.method === "cdek_pvz") {
+      const pt = document.createElement("button");
+      pt.className = "co-pickbtn"; pt.id = "coPoint";
+      pt.onclick = openPointPicker;
+      g.appendChild(wrapField(pt));
+    } else {
+      const addr = document.createElement("textarea");
+      addr.rows = 2; addr.placeholder = "Улица, дом, квартира";
+      addr.value = d.address;
+      addr.oninput = () => { d.address = addr.value; updateCheckoutInfo(); };
+      g.appendChild(wrapField(addr));
+    }
+
+    const calc = document.createElement("div");
+    calc.className = "co-calc"; calc.id = "coCalc";
+    g.appendChild(calc);
+    body.appendChild(g);
+  }
+
+  updateCheckoutInfo();
+}
+
+function wrapField(el) {
+  const w = document.createElement("div");
+  w.className = "co-field";
+  w.appendChild(el);
+  return w;
+}
+
+function field(type, placeholder, value, onInput) {
+  const inp = document.createElement("input");
+  inp.type = type; inp.placeholder = placeholder; inp.value = value || "";
+  inp.oninput = () => onInput(inp.value);
+  return wrapField(inp);
+}
+
+function updateCheckoutInfo() {
+  const d = state.delivery;
+  const cityBtn = $("coCity");
+  if (cityBtn) {
+    cityBtn.className = "co-pickbtn" + (d.city ? "" : " empty");
+    cityBtn.innerHTML = d.city
+      ? `${d.city.city}<small>${d.city.region || "город доставки"}</small>`
+      : "Выбрать город";
+  }
+  const ptBtn = $("coPoint");
+  if (ptBtn) {
+    ptBtn.className = "co-pickbtn" + (d.point ? "" : " empty");
+    ptBtn.innerHTML = d.point
+      ? `${d.point.address}<small>${d.point.work_time || d.point.code}</small>`
+      : "Выбрать пункт выдачи";
+    ptBtn.disabled = !d.city;
+  }
+  const calc = $("coCalc");
+  if (calc) {
+    if (d.calcing) { calc.className = "co-calc"; calc.textContent = "считаем доставку…"; }
+    else if (d.error) { calc.className = "co-calc err"; calc.textContent = d.error; }
+    else if (!d.city) { calc.className = "co-calc"; calc.textContent = ""; }
+    else if (d.price === 0) { calc.className = "co-calc"; calc.textContent = `доставка бесплатно${d.period ? ", " + d.period : ""}`; }
+    else { calc.className = "co-calc"; calc.textContent = `доставка ${d.price} ₽${d.period ? ", " + d.period : ""}`; }
+  }
+
+  const parts = [`товар ${goodsPrice()} ₽`];
+  if (d.method !== "pickup" && d.city && !d.error) parts.push(`доставка ${d.price} ₽`);
+  $("coTotal").innerHTML = `${totalPrice()} ₽<small>${parts.join(" + ")}</small>`;
+  $("coSubmit").disabled = !checkoutReady();
+}
+
+function checkoutReady() {
+  const d = state.delivery;
+  if (d.method === "pickup") return true;
+  if (d.calcing || d.error) return false;
+  if (d.name.trim().length < 2) return false;
+  if (d.phone.replace(/\D/g, "").length < 10) return false;
+  if (!d.city) return false;
+  if (d.method === "cdek_pvz") return !!d.point;
+  return d.address.trim().length >= 5;
+}
+
+async function recalcDelivery() {
+  const d = state.delivery;
+  if (d.method === "pickup" || !d.city) return;
+  d.calcing = true; d.error = ""; updateCheckoutInfo();
+  try {
+    const r = await fetch("/api/delivery/calc", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...initHeaders() },
+      body: JSON.stringify({ method: d.method, city_code: d.city.code,
+                             items: state.placed.length }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "не посчиталось");
+    d.price = data.price;
+    d.period = (data.period_min != null && data.period_max != null)
+      ? `${data.period_min}–${data.period_max} дн.` : "";
+  } catch (e) {
+    d.price = 0; d.period = "";
+    d.error = String(e.message || e);
+  } finally {
+    d.calcing = false; updateCheckoutInfo();
+  }
+}
+
+/* ---------- Выбиральщик: города и пункты выдачи ---------- */
+
+let pickTimer = null;
+let pickPoints = [];   // кэш ПВЗ текущего города
+
+function openPicker(title, placeholder, onInput) {
+  $("pick").classList.remove("hidden");
+  $("pickTitle").textContent = title;
+  const inp = $("pickInput");
+  inp.value = ""; inp.placeholder = placeholder;
+  inp.oninput = () => {
+    clearTimeout(pickTimer);
+    pickTimer = setTimeout(() => onInput(inp.value), 300);
+  };
+  $("pickList").innerHTML = "";
+  setTimeout(() => inp.focus(), 60);
+}
+
+function closePicker() { $("pick").classList.add("hidden"); clearTimeout(pickTimer); }
+
+function pickMessage(text) {
+  $("pickList").innerHTML = `<div class="pick-empty">${text}</div>`;
+}
+
+function renderPickList(items, render, onPick) {
+  const list = $("pickList");
+  list.innerHTML = "";
+  if (!items.length) return pickMessage("Ничего не нашлось");
+  for (const it of items) {
+    const d = document.createElement("div");
+    d.className = "pick-item";
+    d.innerHTML = render(it);
+    d.onclick = (e) => {
+      if (e.target.classList.contains("m")) return;   // ссылка на карту
+      onPick(it);
+    };
+    list.appendChild(d);
+  }
+}
+
+function openCityPicker() {
+  openPicker("Город доставки", "Начни вводить название", async (q) => {
+    if (q.trim().length < 2) return pickMessage("Введи хотя бы две буквы");
+    pickMessage("Ищем…");
+    try {
+      const r = await fetch(`/api/delivery/cities?q=${encodeURIComponent(q)}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || "СДЭК не отвечает");
+      renderPickList(data,
+        c => `<div class="t">${c.city}</div><div class="s">${c.region || ""}</div>`,
+        c => {
+          state.delivery.city = c;
+          state.delivery.point = null;
+          pickPoints = [];
+          closePicker(); haptic();
+          updateCheckoutInfo();
+          recalcDelivery();
+        });
+    } catch (e) { pickMessage(String(e.message || e)); }
+  });
+  pickMessage("Введи название города");
+}
+
+async function openPointPicker() {
+  const d = state.delivery;
+  if (!d.city) return;
+  openPicker(`Пункты выдачи, ${d.city.city}`, "Поиск по адресу", (q) => showPoints(q));
+  pickMessage("Загружаем пункты…");
+  if (!pickPoints.length) {
+    try {
+      const r = await fetch(`/api/delivery/points?city_code=${d.city.code}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || "СДЭК не отвечает");
+      pickPoints = data;
+    } catch (e) { return pickMessage(String(e.message || e)); }
+  }
+  showPoints("");
+}
+
+function showPoints(q) {
+  const needle = (q || "").trim().toLowerCase();
+  const list = needle
+    ? pickPoints.filter(p => (p.address + " " + p.name).toLowerCase().includes(needle))
+    : pickPoints;
+  if (!pickPoints.length) return pickMessage("В этом городе пунктов выдачи нет — выбери курьера");
+  renderPickList(list.slice(0, 120),
+    p => `<div class="t">${p.address}</div>
+          <div class="s">${p.work_time || ""}</div>
+          ${p.lat && p.lon ? `<span class="m" data-lat="${p.lat}" data-lon="${p.lon}">на карте</span>` : ""}`,
+    p => {
+      state.delivery.point = p;
+      closePicker(); haptic(); updateCheckoutInfo();
+    });
+  // «на карте» открываем во внешнем браузере, внутри мини-аппа карта не нужна
+  $("pickList").querySelectorAll(".m").forEach(el => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const url = `https://yandex.ru/maps/?pt=${el.dataset.lon},${el.dataset.lat}&z=17&l=map`;
+      tg?.openLink ? tg.openLink(url) : window.open(url, "_blank");
+    };
+  });
+}
+
+/* ---------- Отправка заказа ---------- */
+
+function deliveryPayload() {
+  const d = state.delivery;
+  if (d.method === "pickup") return { method: "pickup" };
+  return {
+    method: d.method,
+    name: d.name.trim(),
+    phone: d.phone.trim(),
+    city_code: d.city.code,
+    city_name: d.city.city,
+    point_code: d.method === "cdek_pvz" ? d.point.code : null,
+    address: d.method === "cdek_door" ? d.address.trim() : null,
+  };
+}
+
 async function submitOrder() {
-  const btn = $("btnOrder"); btn.disabled = true; btn.textContent = "…";
+  const btn = state.cfg.delivery?.cdek ? $("coSubmit") : $("btnOrder");
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "…";
   const body = {
     size: state.size,
     items: state.placed.map(p => ({
       side: p.side, sticker_id: p.s.id,
       x_mm: +p.x_mm.toFixed(1), y_mm: +p.y_mm.toFixed(1), rotation: p.rotation,
     })),
+    delivery: deliveryPayload(),
   };
-  const r = await fetch("/api/orders", {
-    method: "POST",
-    headers: { "Content-Type": "application/json",
-               "X-Telegram-Init-Data": tg?.initData || "" },
-    body: JSON.stringify(body),
-  });
-  const data = await r.json().catch(() => ({}));
+  let r, data;
+  try {
+    r = await fetch("/api/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...initHeaders() },
+      body: JSON.stringify(body),
+    });
+    data = await r.json().catch(() => ({}));
+  } catch (e) {
+    tg?.showAlert?.("Сеть подвела. Попробуй ещё раз.");
+    btn.disabled = false; btn.textContent = label;
+    return;
+  }
   if (!r.ok) {
     tg?.showAlert?.(data.detail || "Не получилось создать заказ");
-    btn.disabled = false; btn.textContent = "Заказать";
+    btn.disabled = false; btn.textContent = label;
     return;
   }
   haptic("heavy");
+  closeCheckout();
   const hold = data.hold_minutes
     ? `<br><br>Ссылка ждёт ${data.hold_minutes} минут — потом принты вернутся в каталог.`
     : "";
+  const where = data.delivery_method === "pickup"
+    ? "Заберёшь в поп-апе — пришлём адрес, когда будет готово."
+    : `Доставка: ${METHOD_NAMES[data.delivery_method]}. Трек-номер пришлём в чат.`;
   const ov = $("overlay");
   ov.classList.remove("hidden");
   ov.innerHTML = `
     <h2>Заказ принят</h2>
     <div class="num">№${data.order_id}</div>
-    <p>Сумма ${data.price} ₽. ${data.pay_url
-      ? "Ссылка на оплату — в чате с ботом."
-      : "Реквизиты для оплаты придут в чат с ботом."}${hold}<br><br>
-    После оплаты возьмём в работу и напишем, когда будет готово.</p>`;
-  setTimeout(() => tg?.close?.(), data.pay_url ? 1800 : 2600);
+    <p>Сумма ${data.price} ₽${data.delivery_price ? ` (с доставкой ${data.delivery_price} ₽)` : ""}.
+    ${data.pay_url ? "Ссылка на оплату — в чате с ботом." : "Реквизиты для оплаты придут в чат с ботом."}${hold}<br><br>
+    ${where}</p>`;
+  setTimeout(() => tg?.close?.(), data.pay_url ? 2200 : 2800);
 }
 
 /* ---------- События ---------- */
@@ -447,12 +782,15 @@ $("btnDelete").onclick = () => {
   state.placed = state.placed.filter(p => p.uid !== state.sel);
   state.sel = null; renderAll(); renderCatalog(); haptic();
 };
-$("btnOrder").onclick = submitOrder;
+$("btnOrder").onclick = openCheckout;
+$("coBack").onclick = closeCheckout;
+$("coSubmit").onclick = submitOrder;
+$("pickBack").onclick = closePicker;
 window.addEventListener("resize", () => { layout(); renderAll(); });
 
 /* Пока тащим принт, страница не должна прокручиваться: именно эта прокрутка
-   на телефоне и превращается в жест «свернуть мини-апп». Каталога не касается —
-   класс висит только во время перетаскивания. */
+   на телефоне и превращается в жест «свернуть мини-апп». Каталога и экрана
+   оформления не касается — класс висит только во время перетаскивания. */
 document.addEventListener("touchmove", (e) => {
   if (document.body.classList.contains("dragging")) e.preventDefault();
 }, { passive: false });
