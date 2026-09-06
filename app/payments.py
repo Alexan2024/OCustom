@@ -17,6 +17,11 @@ GET /v3/payments/{id} и сверяем статус и сумму. Поддел
 Доставка в чеке идёт отдельной строкой как услуга — иначе сумма позиций
 не сойдётся с суммой платежа, и ЮKassa откажет.
 
+Контакт покупателя в чеке — электронная почта. Телефона мало: по нему чек
+доставляется SMS-кой, а SMS у ОФД по умолчанию выключены, и покупатель
+остаётся ни с чем, хотя в налоговую чек уходит. Почту спрашиваем в мини-аппе
+на экране оформления.
+
 В чеке обязательно едет система налогообложения (tax_system_code, на стороне
 кассы — sno). Без неё Атол отбивает весь чек ошибкой валидации, а платёж
 падает с httpStatus=400. У ÖMANKÖ — УСН «Доходы», код 2.
@@ -51,6 +56,22 @@ def _auth() -> tuple[str, str]:
 def _rub(value: int | float) -> str:
     """ЮKassa ждёт сумму строкой с двумя знаками: 3000 → '3000.00'."""
     return f"{float(value):.2f}"
+
+
+# Почта покупателя. Строгую проверку не строим: адрес всё равно проверит
+# ЮKassa, а лишняя придирчивость регулярки отсечёт живой адрес.
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$")
+EMAIL_MAX_LEN = 64   # предел ЮKassa
+
+
+def normalize_email(raw: str | None) -> str | None:
+    """« Ivan@Mail.RU » → 'ivan@mail.ru'. None — адрес не годится."""
+    if not raw:
+        return None
+    email = raw.strip().lower()
+    if len(email) > EMAIL_MAX_LEN or not EMAIL_RE.match(email):
+        return None
+    return email
 
 
 def normalize_phone(raw: str | None) -> str | None:
@@ -101,10 +122,17 @@ def tax_system_code() -> int | None:
 
 
 def build_receipt(order: dict) -> dict | None:
-    """Состав чека. Позиции обязаны в сумме давать цену заказа."""
+    """Состав чека. Позиции обязаны в сумме давать цену заказа.
+
+    Контакт покупателя обязателен, и главный тут — почта. По телефону чек
+    доставляется только SMS-кой, а SMS у ОФД обычно не включены: чек уходит
+    в налоговую, а человек не получает ничего. Именно так мы и попались
+    на первом боевом платеже. Телефон кладём вдобавок, когда он есть.
+    """
+    email = normalize_email(order.get("email"))
     phone = normalize_phone(order.get("phone"))
-    if not phone:
-        raise PaymentError("Для чека нужен телефон покупателя")
+    if not email and not phone:
+        raise PaymentError("Для чека нужна почта или телефон покупателя")
 
     items = [{
         "description": f"Футболка {config.BRAND} с печатью, размер {order['size']}"[:128],
@@ -142,7 +170,12 @@ def build_receipt(order: dict) -> dict | None:
         raise PaymentError(
             f"Чек не сходится с заказом: {total} ≠ {order['price']} ₽")
 
-    receipt = {"customer": {"phone": phone}, "items": items}
+    customer = {}
+    if email:
+        customer["email"] = email
+    if phone:
+        customer["phone"] = phone
+    receipt = {"customer": customer, "items": items}
     sno = tax_system_code()
     if sno is not None:
         receipt["tax_system_code"] = sno
