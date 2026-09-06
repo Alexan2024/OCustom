@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS orders (
     user_id INTEGER NOT NULL,
     username TEXT,
     first_name TEXT,
-    phone TEXT,                  -- телефон покупателя (нужен для чека по 54-ФЗ)
+    phone TEXT,                  -- телефон покупателя (нужен доставке)
+    email TEXT,                  -- почта покупателя: туда уходит чек по 54-ФЗ
     size TEXT NOT NULL,
     price INTEGER NOT NULL,      -- итог: товар + доставка
     status TEXT NOT NULL DEFAULT 'new',
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS orders (
     cdek_number TEXT,            -- трек-номер
     cdek_status TEXT,
     cdek_status_text TEXT,
+    terms_accepted_at TEXT,      -- когда покупатель подтвердил условия возврата
     view_token TEXT NOT NULL,    -- для просмотра раскладки сотрудником по ссылке
     staff_msg_id INTEGER,        -- id карточки в чате сотрудников
     created_at TEXT NOT NULL DEFAULT ({NOW_SQL})
@@ -65,6 +67,7 @@ CREATE TABLE IF NOT EXISTS order_items (
 CREATE TABLE IF NOT EXISTS customers (
     user_id INTEGER PRIMARY KEY,
     phone TEXT,
+    email TEXT,
     updated_at TEXT NOT NULL DEFAULT ({NOW_SQL})
 );
 """
@@ -72,6 +75,8 @@ CREATE TABLE IF NOT EXISTS customers (
 # Колонки, которые могли появиться позже схемы. Порядок важен только для лога.
 LATE_COLUMNS = (
     ("phone", "TEXT"),
+    ("email", "TEXT"),
+    ("terms_accepted_at", "TEXT"),
     ("payment_id", "TEXT"),
     ("delivery_method", "TEXT NOT NULL DEFAULT 'pickup'"),
     ("delivery_price", "INTEGER NOT NULL DEFAULT 0"),
@@ -85,6 +90,12 @@ LATE_COLUMNS = (
     ("cdek_number", "TEXT"),
     ("cdek_status", "TEXT"),
     ("cdek_status_text", "TEXT"),
+)
+
+# То же самое для таблицы покупателей: CREATE TABLE IF NOT EXISTS уже
+# развёрнутую таблицу не переписывает, поэтому почту приходится доливать.
+CUSTOMER_LATE_COLUMNS = (
+    ("email", "TEXT"),
 )
 
 
@@ -132,6 +143,11 @@ def _migrate():
             if name not in cols:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
                 log.info("Миграция: добавлена колонка orders.%s", name)
+        ccols = {r["name"] for r in c.execute("PRAGMA table_info(customers)")}
+        for name, ddl in CUSTOMER_LATE_COLUMNS:
+            if name not in ccols:
+                c.execute(f"ALTER TABLE customers ADD COLUMN {name} {ddl}")
+                log.info("Миграция: добавлена колонка customers.%s", name)
         _fix_legacy_created_at(c)
 
 
@@ -255,6 +271,32 @@ def get_phone(user_id: int) -> str | None:
     return row["phone"] if row else None
 
 
+def set_email(user_id: int, email: str):
+    with conn() as c:
+        c.execute(
+            f"INSERT INTO customers (user_id, email, updated_at) VALUES (?,?,{NOW_SQL}) "
+            f"ON CONFLICT(user_id) DO UPDATE SET email=excluded.email, updated_at={NOW_SQL}",
+            (user_id, email),
+        )
+
+
+def get_email(user_id: int) -> str | None:
+    with conn() as c:
+        row = c.execute("SELECT email FROM customers WHERE user_id=?", (user_id,)).fetchone()
+    return row["email"] if row else None
+
+
+def get_contacts(user_id: int) -> dict:
+    """Телефон и почта одним запросом — для подстановки в мини-апп."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT phone, email FROM customers WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if not row:
+        return {"phone": "", "email": ""}
+    return {"phone": row["phone"] or "", "email": row["email"] or ""}
+
+
 # ---------- Квота ----------
 
 def orders_today() -> int:
@@ -281,12 +323,18 @@ class OrderError(Exception):
 
 
 def create_order(user, size: str, items: list, price: int,
-                 phone: str | None = None, delivery: dict | None = None) -> dict:
+                 phone: str | None = None, delivery: dict | None = None,
+                 email: str | None = None, terms_accepted: bool = False) -> dict:
     """items: [{side, sticker_id, x_mm, y_mm, rotation}, ...]
 
     delivery: {method, price, recipient_name, city_code, city_name,
                pvz_code, pvz_address, address} — для самовывоза достаточно
     {"method": "pickup"}.
+
+    email — контакт для чека по 54-ФЗ. terms_accepted — покупатель отметил
+    галочку про невозвратность изделия по индивидуальному макету; момент
+    согласия пишем в заказ, чтобы было чем подтвердить, если дойдёт
+    до претензии.
 
     Резервирует остатки стикеров атомарно.
     """
@@ -320,17 +368,19 @@ def create_order(user, size: str, items: list, price: int,
             c.execute("UPDATE stickers SET stock=stock-? WHERE id=?", (cnt, sid))
         # Время пишем сами, а не дефолтом таблицы: в старых базах дефолт остался
         # в UTC, и заказ рождался «на три часа старше», чем есть.
+        created = stamp(now_local())
         cur = c.execute(
-            "INSERT INTO orders (user_id, username, first_name, phone, size, price,"
+            "INSERT INTO orders (user_id, username, first_name, phone, email, size, price,"
             " delivery_method, delivery_price, recipient_name, city_code, city_name,"
-            " pvz_code, pvz_address, address, view_token, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " pvz_code, pvz_address, address, terms_accepted_at, view_token, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (user["id"], user.get("username"), user.get("first_name"),
-             phone, size, price,
+             phone, email, size, price,
              d["method"], int(d.get("price") or 0), d.get("recipient_name"),
              d.get("city_code"), d.get("city_name"), d.get("pvz_code"),
              d.get("pvz_address"), d.get("address"),
-             secrets.token_urlsafe(8), stamp(now_local())),
+             created if terms_accepted else None,
+             secrets.token_urlsafe(8), created),
         )
         oid = cur.lastrowid
         for it in items:
