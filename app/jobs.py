@@ -75,8 +75,7 @@ async def check_payment(oid: int, source: str = "опрос") -> bool:
 
     o = db.get_order(oid)
     log.info("Заказ №%s оплачен (%s)", oid, source)
-    await tgbot.notify_customer_status(o, "paid")
-    await tgbot.refresh_or_send_staff_card(o)
+    await tgbot.after_paid(o)
 
     if not _polling_reported:
         _polling_reported = True
