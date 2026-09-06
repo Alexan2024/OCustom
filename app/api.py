@@ -44,14 +44,32 @@ def get_config():
             "cdek": cdek.enabled(),
             "free_from": config.FREE_DELIVERY_FROM,
         },
+        # Нужна ли почта на экране оформления:
+        #   required — чек пробивается, без адреса чек некуда отправить
+        #   optional — касса ещё не подключена, но адрес пригодится
+        #   off      — оплата ручная, чеков нет вовсе
+        "receipt": {"email": receipt_email_mode()},
+        "return_policy": {
+            "short": config.RETURN_POLICY_SHORT,
+            "full": config.RETURN_POLICY_TEXT,
+        },
     }
+
+
+def receipt_email_mode() -> str:
+    if not payments.enabled():
+        return "off"
+    return "required" if config.YOOKASSA_SEND_RECEIPT else "optional"
 
 
 @app.get("/api/me")
 def get_me(x_telegram_init_data: str | None = Header(default=None)):
-    """Чтобы не заставлять человека вводить телефон, который он уже давал."""
+    """Чтобы не заставлять человека вводить то, что он уже давал: имя,
+    телефон и почту для чека."""
     user = require_user(x_telegram_init_data)
-    return {"phone": db.get_phone(user["id"]) or "",
+    contacts = db.get_contacts(user["id"])
+    return {"phone": contacts["phone"],
+            "email": contacts["email"],
             "name": " ".join(filter(None, [user.get("first_name"),
                                            user.get("last_name")])).strip()}
 
@@ -134,6 +152,11 @@ class NewOrder(BaseModel):
     size: str
     items: list[Item] = Field(min_length=1)
     delivery: DeliveryIn = DeliveryIn()
+    email: str | None = None
+    # Галочка «изделие по моему макету, возврату не подлежит». Значение
+    # по умолчанию False: старый закэшированный мини-апп его не пришлёт,
+    # и такой заказ мы завернём с понятной подсказкой, а не примем молча.
+    terms_accepted: bool = False
 
 
 def calc_goods_price(n_items: int) -> int:
@@ -257,21 +280,33 @@ async def create_order(body: NewOrder,
     if len(body.items) > config.MAX_PRINTS:
         raise HTTPException(400, f"Максимум {config.MAX_PRINTS} принтов")
 
+    # Условия возврата человек подтверждает галочкой перед оплатой: изделие
+    # по индивидуальному макету обратно не принимается, и предупредить об этом
+    # надо до денег, а не после.
+    if not body.terms_accepted:
+        raise HTTPException(
+            400, "Отметь галочку с условиями на экране оформления. Если её там нет — "
+                 "закрой мини-апп и открой заново, обновится.")
+
     goods = calc_goods_price(len(body.items))
     delivery, delivery_phone = await resolve_delivery(body.delivery, goods)
 
-    # Телефон получателя — он же контакт для чека. Если человек его ввёл
-    # при оформлении доставки, второй раз спрашивать в боте не нужно.
+    # Телефон нужен доставке. Если человек ввёл его при оформлении,
+    # второй раз спрашивать не нужно.
     phone = delivery_phone or db.get_phone(user["id"])
     if delivery_phone:
         db.set_phone(user["id"], delivery_phone)
 
-    # Чек по 54-ФЗ без контакта покупателя пробить нельзя.
-    if payments.enabled() and config.YOOKASSA_SEND_RECEIPT and not phone:
-        asyncio.create_task(tgbot.ask_phone_safe(user["id"]))
+    # Почта — контакт для чека по 54-ФЗ. Телефона мало: чек по нему уходит
+    # SMS-кой, а SMS у ОФД выключены, и покупатель остаётся ни с чем.
+    if body.email and not payments.normalize_email(body.email):
+        raise HTTPException(400, "Проверь адрес почты — на него придёт чек")
+    email = payments.normalize_email(body.email) or db.get_email(user["id"])
+    if payments.enabled() and config.YOOKASSA_SEND_RECEIPT and not email:
         raise HTTPException(
-            400, "Для чека нужен номер телефона. Открой чат с ботом — там кнопка "
-                 "«Поделиться номером», это один тап. Потом возвращайся и оформи заказ.")
+            400, "Впиши электронную почту — без неё чек некуда отправить")
+    if email:
+        db.set_email(user["id"], email)
 
     stickers = db.sticker_map({i.sticker_id for i in body.items})
     validate_geometry(body.size, body.items, stickers)
@@ -279,7 +314,7 @@ async def create_order(body: NewOrder,
     try:
         order = db.create_order(user, body.size,
                                 [i.model_dump() for i in body.items], price,
-                                phone, delivery)
+                                phone, delivery, email=email, terms_accepted=True)
     except db.OrderError as e:
         raise HTTPException(409, str(e))
 
@@ -302,6 +337,7 @@ async def create_order(body: NewOrder,
     return {"order_id": order["id"], "price": price,
             "delivery_price": order["delivery_price"], "pay_url": pay_url,
             "delivery_method": order["delivery_method"],
+            "receipt_email": email if config.YOOKASSA_SEND_RECEIPT else None,
             "hold_minutes": config.ORDER_HOLD_MINUTES if pay_url else 0}
 
 
