@@ -169,6 +169,14 @@ CDEK_FROM_CITY_CODE = int(_env("CDEK_FROM_CITY_CODE", "44"))  # 44 = Москв�
 CDEK_TARIFF_PVZ = int(_env("CDEK_TARIFF_PVZ", "136"))
 CDEK_TARIFF_DOOR = int(_env("CDEK_TARIFF_DOOR", "137"))
 
+# Когда заводить накладную в СДЭК:
+#   true  — сразу после оплаты. Покупатель получает трек через минуту, но
+#           пару дней по нему ничего не движется: вещь ещё печатают. Так
+#           решили с Пашей — номер на руках важнее пустой истории в трекинге.
+#   false — при переводе заказа в «Готово», перед сдачей пакета в ПВЗ.
+# Накладная, заведённая заранее, гасится сама, если заказ отменяют.
+CDEK_CREATE_ON_PAID = _flag("CDEK_CREATE_ON_PAID", "true")
+
 CDEK_SENDER_NAME = _env("CDEK_SENDER_NAME", BRAND)
 CDEK_SENDER_PHONE = _env("CDEK_SENDER_PHONE", "")
 # Префикс номера заказа на стороне СДЭК: номера должны быть уникальны в рамках
