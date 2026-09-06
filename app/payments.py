@@ -121,6 +121,28 @@ def tax_system_code() -> int | None:
     return code
 
 
+def item_name(size: str) -> str:
+    """Название основной позиции в чеке: «Воркшоп ÖxПГ, размер M».
+
+    Футболкой это больше не зовётся: по кассе мы продаём участие в воркшопе,
+    а размер нужен, чтобы позиция в чеке совпадала с тем, что человек забрал.
+    Название переопределяется переменной RECEIPT_ITEM_NAME.
+    """
+    return f"{config.RECEIPT_ITEM_NAME}, размер {size}"[:128]
+
+
+PAYMENT_MODES = {
+    "full_payment": "полный расчёт",
+    "full_prepayment": "полная предоплата",
+}
+
+
+def payment_mode_label() -> str:
+    """Человеческое название признака расчёта — для /diag."""
+    mode = config.YOOKASSA_PAYMENT_MODE
+    return f"{mode} ({PAYMENT_MODES[mode]})" if mode in PAYMENT_MODES else mode
+
+
 def build_receipt(order: dict) -> dict | None:
     """Состав чека. Позиции обязаны в сумме давать цену заказа.
 
@@ -135,22 +157,22 @@ def build_receipt(order: dict) -> dict | None:
         raise PaymentError("Для чека нужна почта или телефон покупателя")
 
     items = [{
-        "description": f"Футболка {config.BRAND} с печатью, размер {order['size']}"[:128],
+        "description": item_name(order["size"]),
         "quantity": "1.00",
         "amount": {"value": _rub(config.BASE_PRICE), "currency": "RUB"},
         "vat_code": config.YOOKASSA_VAT_CODE,
         "payment_mode": config.YOOKASSA_PAYMENT_MODE,
-        "payment_subject": "commodity",
+        "payment_subject": config.RECEIPT_ITEM_SUBJECT,
     }]
     extra = max(0, len(order["items"]) - config.INCLUDED_PRINTS)
     if extra:
         items.append({
-            "description": "Дополнительный принт",
+            "description": config.RECEIPT_EXTRA_ITEM_NAME[:128],
             "quantity": f"{extra}.00",
             "amount": {"value": _rub(config.EXTRA_PRINT_PRICE), "currency": "RUB"},
             "vat_code": config.YOOKASSA_VAT_CODE,
             "payment_mode": config.YOOKASSA_PAYMENT_MODE,
-            "payment_subject": "commodity",
+            "payment_subject": config.RECEIPT_ITEM_SUBJECT,
         })
     total = config.BASE_PRICE + extra * config.EXTRA_PRINT_PRICE
 
