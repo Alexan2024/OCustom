@@ -24,10 +24,13 @@ def require_user(init_data: str | None) -> dict:
 
 @app.get("/api/config")
 def get_config():
+    # Остаток бланков берём из базы: сотрудник правит его командой /stock,
+    # переменная окружения — только стартовое значение.
+    stock = db.shirt_stock()
     return {
         "brand": config.BRAND,
         "sizes": {
-            s: {**geo, "stock": config.SHIRT_STOCK.get(s, 0),
+            s: {**geo, "stock": stock.get(s, 0),
                 "zones": config.zones(s)}
             for s, geo in config.SIZES.items()
         },
@@ -275,7 +278,7 @@ async def create_order(body: NewOrder,
     user = require_user(x_telegram_init_data)
     if body.size not in config.SIZES:
         raise HTTPException(400, "Неизвестный размер")
-    if config.SHIRT_STOCK.get(body.size, 0) <= 0:
+    if db.shirt_stock_of(body.size) <= 0:
         raise HTTPException(400, f"Размер {body.size} закончился")
     if len(body.items) > config.MAX_PRINTS:
         raise HTTPException(400, f"Максимум {config.MAX_PRINTS} принтов")
@@ -334,6 +337,7 @@ async def create_order(body: NewOrder,
 
     # уведомления не должны валить создание заказа
     asyncio.create_task(_notify_safe(order, pay_url, pay_error))
+    asyncio.create_task(_warn_low_stock(order["size"]))
     return {"order_id": order["id"], "price": price,
             "delivery_price": order["delivery_price"], "pay_url": pay_url,
             "delivery_method": order["delivery_method"],
@@ -361,6 +365,27 @@ async def _notify_safe(order: dict, pay_url: str | None, pay_error: str | None =
                 "команда /diag покажет, что не так с настройками.")
         except Exception as e:
             log.warning("alert staff failed: %s", e)
+
+
+async def _warn_low_stock(size: str):
+    """Бланки заканчиваются — говорим об этом в чат сотрудников.
+
+    Момент, когда размер уходит в ноль, важнее любого отчёта: мини-апп сразу
+    перестаёт его показывать, и узнать об этом из карточки заказа нельзя.
+    """
+    if not config.SHIRT_STOCK_AUTO:
+        return
+    try:
+        left = db.shirt_stock_of(size)
+        if left == 0:
+            await tgbot.alert_staff(
+                f"👕 Бланки размера {size} закончились — размер скрыт в мини-аппе.\n"
+                "Довезли — поправь остаток командой /stock.")
+        elif left <= config.SHIRT_STOCK_LOW:
+            await tgbot.alert_staff(
+                f"👕 Бланков {size} осталось {left} шт. Команда /stock — поправить остаток.")
+    except Exception as e:
+        log.warning("Не смог предупредить про остаток бланков: %s", e)
 
 
 @app.get("/api/orders/{oid}")
