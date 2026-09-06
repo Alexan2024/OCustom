@@ -333,6 +333,22 @@ async def create_shipment(order: dict) -> str:
     return uuid
 
 
+async def delete_shipment(uuid: str) -> None:
+    """Гасит накладную в СДЭК.
+
+    Нужна потому, что накладную мы заводим сразу после оплаты: если заказ
+    потом отменяют, посылки не будет, а накладная останется висеть
+    в договоре. СДЭК разрешает удаление, только пока пакет не приняли
+    физически — после приёмки вернётся ошибка, и гасить придётся руками.
+    """
+    if not enabled():
+        raise CdekError("Доставка СДЭК выключена (DELIVERY_CDEK)")
+    data = await _call("DELETE", f"/orders/{uuid}")
+    err = _errors(data)
+    if err:
+        raise CdekError(err)
+
+
 async def fetch_shipment(uuid: str) -> dict:
     """Состояние накладной: номер трека, код и текст последнего статуса.
 
