@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS customers (
     email TEXT,
     updated_at TEXT NOT NULL DEFAULT ({NOW_SQL})
 );
+CREATE TABLE IF NOT EXISTS shirt_stock (
+    size TEXT PRIMARY KEY,       -- S | M | L | XL
+    stock INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT ({NOW_SQL})
+);
 """
 
 # Колонки, которые могли появиться позже схемы. Порядок важен только для лога.
@@ -132,6 +137,7 @@ def init_db():
     with conn() as c:
         c.executescript(SCHEMA)
     _migrate()
+    _seed_shirt_stock()
     sync_stickers_from_csv()
 
 
@@ -176,6 +182,71 @@ def _fix_legacy_created_at(c):
         ).rowcount
         log.info("Миграция: время у %d заказов переведено из UTC в местное", n)
     c.execute("PRAGMA user_version = 1")
+
+
+# ---------- Остаток бланков ----------
+
+def _seed_shirt_stock():
+    """Заводит строку остатка на каждый размер, которого ещё нет в базе.
+
+    SHIRT_STOCK в переменных окружения — только стартовое значение. Дальше
+    число живёт в базе и правится командой /stock из чата сотрудников:
+    остаток меняется на складе каждый день, а редеплой ради «минус одна
+    футболка» никто делать не будет.
+    """
+    with conn() as c:
+        have = {r["size"] for r in c.execute("SELECT size FROM shirt_stock")}
+        for size in config.SIZES:
+            if size in have:
+                continue
+            n = int(config.SHIRT_STOCK.get(size, 0))
+            c.execute(
+                f"INSERT INTO shirt_stock (size, stock, updated_at) "
+                f"VALUES (?,?,{NOW_SQL})", (size, n))
+            log.info("Остаток бланков %s заведён в базе: %d шт.", size, n)
+
+
+def shirt_stock() -> dict[str, int]:
+    """Остаток по всем размерам в порядке config.SIZES."""
+    with conn() as c:
+        rows = c.execute("SELECT size, stock FROM shirt_stock").fetchall()
+    have = {r["size"]: int(r["stock"]) for r in rows}
+    return {s: have.get(s, int(config.SHIRT_STOCK.get(s, 0))) for s in config.SIZES}
+
+
+def shirt_stock_of(size: str) -> int:
+    return shirt_stock().get(size, 0)
+
+
+def set_shirt_stock(size: str, value: int) -> int:
+    """Ставит точное число. Возвращает то, что реально записалось."""
+    value = max(0, min(9999, int(value)))
+    with conn() as c:
+        c.execute(
+            f"INSERT INTO shirt_stock (size, stock, updated_at) VALUES (?,?,{NOW_SQL}) "
+            f"ON CONFLICT(size) DO UPDATE SET stock=excluded.stock, updated_at={NOW_SQL}",
+            (size, value),
+        )
+    return value
+
+
+def add_shirt_stock(size: str, delta: int) -> int:
+    """Прибавляет (или отнимает) штуки. Ниже нуля не уходим.
+
+    Считаем в одной транзакции: кнопки в чате жмут двое сотрудников сразу,
+    и «прочитал — сложил — записал» на стороне бота потеряло бы одно нажатие.
+    """
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT stock FROM shirt_stock WHERE size=?", (size,)).fetchone()
+        cur = int(row["stock"]) if row else int(config.SHIRT_STOCK.get(size, 0))
+        new = max(0, min(9999, cur + int(delta)))
+        c.execute(
+            f"INSERT INTO shirt_stock (size, stock, updated_at) VALUES (?,?,{NOW_SQL}) "
+            f"ON CONFLICT(size) DO UPDATE SET stock=excluded.stock, updated_at={NOW_SQL}",
+            (size, new),
+        )
+    return new
 
 
 def sync_stickers_from_csv():
@@ -366,6 +437,21 @@ def create_order(user, size: str, items: list, price: int,
                 raise OrderError(f"Принт «{nm}» уже разобрали. Убери его или выбери другой.")
         for sid, cnt in need.items():
             c.execute("UPDATE stickers SET stock=stock-? WHERE id=?", (cnt, sid))
+        # Бланк. Остаток лежит в базе и уменьшается вместе с заказом — так же,
+        # как остаток принтов. Проверка здесь, внутри транзакции: снаружи её
+        # делает и api.py, но между той проверкой и записью заказа помещается
+        # чужой заказ на последнюю футболку.
+        if config.SHIRT_STOCK_AUTO:
+            row = c.execute(
+                "SELECT stock FROM shirt_stock WHERE size=?", (size,)).fetchone()
+            left = int(row["stock"]) if row else int(config.SHIRT_STOCK.get(size, 0))
+            if left <= 0:
+                raise OrderError(f"Бланки размера {size} закончились. Выбери другой размер.")
+            c.execute(
+                f"INSERT INTO shirt_stock (size, stock, updated_at) VALUES (?,?,{NOW_SQL}) "
+                f"ON CONFLICT(size) DO UPDATE SET stock=excluded.stock, updated_at={NOW_SQL}",
+                (size, left - 1),
+            )
         # Время пишем сами, а не дефолтом таблицы: в старых базах дефолт остался
         # в UTC, и заказ рождался «на три часа старше», чем есть.
         created = stamp(now_local())
@@ -438,6 +524,13 @@ def _restock(c, oid: int):
     ).fetchall():
         c.execute("UPDATE stickers SET stock=stock+? WHERE id=?",
                   (row["n"], row["sticker_id"]))
+    # Бланк возвращаем туда же, откуда взяли при создании заказа.
+    if config.SHIRT_STOCK_AUTO:
+        row = c.execute("SELECT size FROM orders WHERE id=?", (oid,)).fetchone()
+        if row:
+            c.execute(
+                f"UPDATE shirt_stock SET stock=stock+1, updated_at={NOW_SQL} WHERE size=?",
+                (row["size"],))
 
 
 def set_payment_id(oid: int, payment_id: str):
