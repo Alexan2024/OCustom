@@ -59,6 +59,38 @@ STATUS_TEXT = {
 DONE_STATUSES = ("DELIVERED",)
 # Статусы, о которых надо позвать живого человека
 ALERT_STATUSES = ("NOT_DELIVERED", "RETURNED_TO_SENDER", "INVALID")
+# Статусы, означающие, что пакет физически уже у СДЭК. С этого момента заказ
+# считается переданным в доставку, даже если сотрудник не нажал кнопку:
+# пакет сдали в ПВЗ, а телефон в этот момент в кармане.
+# «Накладная создана» сюда не входит — она заводится сразу после оплаты,
+# когда футболку ещё даже не печатали.
+SHIPPED_STATUSES = (
+    "RECEIVED_AT_SHIPMENT_WAREHOUSE",
+    "READY_FOR_SHIPMENT_IN_SENDER_CITY",
+    "TAKEN_BY_TRANSPORTER_FROM_SENDER_CITY",
+    "SENT_TO_TRANSIT_CITY",
+    "ACCEPTED_IN_TRANSIT_CITY",
+    "SENT_TO_RECIPIENT_CITY",
+    "ACCEPTED_IN_RECIPIENT_CITY",
+    "ACCEPTED_AT_PICK_UP_POINT",
+    "READY_FOR_SHIPMENT_IN_RECIPIENT_CITY",
+    "TAKEN_BY_COURIER",
+)
+
+
+def looks_shipped(info: dict) -> bool:
+    """Посылка уже уехала? Ответ по состоянию накладной из fetch_shipment.
+
+    Смотрим не только на последний статус, но и на всю историю: между двумя
+    опросами посылка успевает проскочить несколько состояний, и «принят на
+    склад отправителя» может прийти и уехать, пока бот молчал. Достаточно
+    одного факта приёмки в прошлом — назад посылка не отматывается.
+    """
+    last = info.get("status") or ""
+    if last in DONE_STATUSES or last in ALERT_STATUSES:
+        return False
+    codes = info.get("codes") or ([last] if last else [])
+    return any(c in SHIPPED_STATUSES for c in codes)
 
 
 class CdekError(Exception):
@@ -352,7 +384,9 @@ async def delete_shipment(uuid: str) -> None:
 async def fetch_shipment(uuid: str) -> dict:
     """Состояние накладной: номер трека, код и текст последнего статуса.
 
-    Возвращает {"number", "status", "text", "invalid", "error"}.
+    Возвращает {"number", "status", "text", "codes", "invalid", "error"}.
+    "codes" — вся история статусов: по ней видно, что посылку приняли,
+    даже если опрос пропустил этот момент и последний статус уже другой.
     """
     data = await _call("GET", f"/orders/{uuid}")
     entity = data.get("entity") or {}
@@ -362,6 +396,7 @@ async def fetch_shipment(uuid: str) -> dict:
     error = _errors({"requests": requests}) if invalid else ""
 
     statuses = entity.get("statuses") or []
+    codes = [s.get("code") for s in statuses if s.get("code")]
     code, text = "", ""
     if statuses:
         last = statuses[-1]
@@ -374,6 +409,7 @@ async def fetch_shipment(uuid: str) -> dict:
         "number": entity.get("cdek_number") or "",
         "status": code,
         "text": text,
+        "codes": codes,
         "invalid": invalid,
         "error": error,
     }
