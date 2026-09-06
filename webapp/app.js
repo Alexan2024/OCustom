@@ -64,7 +64,17 @@ const state = {
     address: "",
     price: 0, period: "", calcing: false, error: "",
   },
+  contact: {
+    email: "",         // куда уйдёт чек по 54-ФЗ
+    terms: false,      // галочка «изделие по моему макету, возврату не подлежит»
+    legalOpen: false,  // раскрыт ли полный текст условий
+  },
 };
+
+/* Проверка почты только для кнопки: настоящую проверку делает сервер,
+   а следом за ним ЮKassa. Здесь важно не быть строже них. */
+const EMAIL_RE = /^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$/;
+const emailOk = (v) => EMAIL_RE.test((v || "").trim().toLowerCase());
 
 const haptic = (t = "light") => tg?.HapticFeedback?.impactOccurred?.(t);
 const initHeaders = () => ({ "X-Telegram-Init-Data": tg?.initData || "" });
@@ -159,17 +169,16 @@ async function boot() {
   renderSizes(); renderCatalog(); layout(); renderAll(); updateBar();
   hideBoot();
 
-  // Имя и телефон, если человек их уже давал — чтобы не вводил заново
-  if (cfg.delivery?.cdek) {
-    fetch("/api/me", { headers: initHeaders() })
-      .then(r => r.ok ? r.json() : null)
-      .then(me => {
-        if (!me) return;
-        state.delivery.name = state.delivery.name || me.name || "";
-        state.delivery.phone = state.delivery.phone || me.phone || "";
-      })
-      .catch(() => {});
-  }
+  // Имя, телефон и почта, если человек их уже давал — чтобы не вводил заново
+  fetch("/api/me", { headers: initHeaders() })
+    .then(r => r.ok ? r.json() : null)
+    .then(me => {
+      if (!me) return;
+      state.delivery.name = state.delivery.name || me.name || "";
+      state.delivery.phone = state.delivery.phone || me.phone || "";
+      state.contact.email = state.contact.email || me.email || "";
+    })
+    .catch(() => {});
 
   setInterval(refreshStock, STOCK_POLL_MS);
 }
@@ -816,8 +825,8 @@ function updateBar() {
 /* ---------- Оформление ---------- */
 
 function openCheckout() {
-  // Пока доставка выключена, второй экран не нужен: способ получения один.
-  if (!state.cfg.delivery?.cdek) return submitOrder();
+  // Экран нужен всегда, даже когда способ получения один: на нём человек
+  // оставляет почту для чека и подтверждает условия возврата.
   show($("checkout"));
   pushNav(closeCheckout);
   renderCheckout();
@@ -840,26 +849,28 @@ function renderCheckout() {
   const body = $("coBody");
   body.innerHTML = "";
 
-  // способ получения
-  const g1 = document.createElement("div");
-  g1.className = "co-group";
-  g1.innerHTML = '<div class="co-label">Как получишь</div>';
-  const methods = document.createElement("div");
-  methods.className = "co-methods";
-  const opts = [
-    ["pickup", "Самовывоз", "Бесплатно, в поп-апе"],
-    ["cdek_pvz", "СДЭК, пункт выдачи", "Заберёшь в ближайшем ПВЗ"],
-    ["cdek_door", "СДЭК, курьер", "Привезут по адресу"],
-  ];
-  for (const [m, title, sub] of opts) {
-    const b = document.createElement("button");
-    b.className = "co-method" + (d.method === m ? " active" : "");
-    b.innerHTML = `<div>${title}</div><small>${sub}</small>`;
-    b.onclick = () => setMethod(m);
-    methods.appendChild(b);
+  // способ получения; когда СДЭК выключен, выбирать не из чего
+  if (state.cfg.delivery?.cdek) {
+    const g1 = document.createElement("div");
+    g1.className = "co-group";
+    g1.innerHTML = '<div class="co-label">Как получишь</div>';
+    const methods = document.createElement("div");
+    methods.className = "co-methods";
+    const opts = [
+      ["pickup", "Самовывоз", "Бесплатно, в поп-апе"],
+      ["cdek_pvz", "СДЭК, пункт выдачи", "Заберёшь в ближайшем ПВЗ"],
+      ["cdek_door", "СДЭК, курьер", "Привезут по адресу"],
+    ];
+    for (const [m, title, sub] of opts) {
+      const b = document.createElement("button");
+      b.className = "co-method" + (d.method === m ? " active" : "");
+      b.innerHTML = `<div>${title}</div><small>${sub}</small>`;
+      b.onclick = () => setMethod(m);
+      methods.appendChild(b);
+    }
+    g1.appendChild(methods);
+    body.appendChild(g1);
   }
-  g1.appendChild(methods);
-  body.appendChild(g1);
 
   if (d.method === "pickup") {
     const g = document.createElement("div");
@@ -901,7 +912,64 @@ function renderCheckout() {
     body.appendChild(g);
   }
 
+  renderReceiptGroup(body);
+  renderTermsGroup(body);
   updateCheckoutInfo();
+}
+
+/* Почта для чека. По телефону чек уходит SMS-кой, а SMS у ОФД выключены —
+   поэтому спрашиваем именно адрес, а не только номер. */
+function renderReceiptGroup(body) {
+  const mode = state.cfg.receipt?.email || "off";
+  if (mode === "off") return;
+  const c = state.contact;
+  const g = document.createElement("div");
+  g.className = "co-group";
+  g.innerHTML = `<div class="co-label">Чек${mode === "optional" ? " (необязательно)" : ""}</div>`;
+  g.appendChild(field("email", "почта для чека", c.email, v => {
+    c.email = v; updateCheckoutInfo();
+  }));
+  const note = document.createElement("div");
+  note.className = "co-note";
+  note.textContent = "Электронный чек придёт сюда сразу после оплаты. "
+    + "Ничего больше на эту почту мы не отправляем.";
+  g.appendChild(note);
+  body.appendChild(g);
+}
+
+/* Условия возврата. Изделие по индивидуальному макету обратно не принимается,
+   и узнать об этом человек должен до оплаты, а не после. */
+function renderTermsGroup(body) {
+  const policy = state.cfg.return_policy || {};
+  const c = state.contact;
+  const g = document.createElement("div");
+  g.className = "co-group";
+
+  const label = document.createElement("label");
+  label.className = "co-check";
+  const box = document.createElement("input");
+  box.type = "checkbox"; box.checked = c.terms;
+  box.onchange = () => { c.terms = box.checked; updateCheckoutInfo(); haptic(); };
+  const span = document.createElement("span");
+  span.textContent = policy.short || "";
+  label.appendChild(box); label.appendChild(span);
+  g.appendChild(label);
+
+  if (policy.full) {
+    const more = document.createElement("button");
+    more.className = "co-more"; more.type = "button";
+    more.textContent = c.legalOpen ? "Свернуть" : "Подробнее";
+    const legal = document.createElement("div");
+    legal.className = "co-legal" + (c.legalOpen ? "" : " hidden");
+    legal.textContent = policy.full;
+    more.onclick = () => {
+      c.legalOpen = !c.legalOpen;
+      legal.classList.toggle("hidden", !c.legalOpen);
+      more.textContent = c.legalOpen ? "Свернуть" : "Подробнее";
+    };
+    g.appendChild(more); g.appendChild(legal);
+  }
+  body.appendChild(g);
 }
 
 function wrapField(el) {
@@ -953,6 +1021,9 @@ function updateCheckoutInfo() {
 function checkoutReady() {
   const d = state.delivery;
   if (state.gone.size) return false;
+  if (!state.contact.terms) return false;
+  if (state.cfg.receipt?.email === "required" && !emailOk(state.contact.email)) return false;
+  if (state.contact.email.trim() && !emailOk(state.contact.email)) return false;
   if (d.method === "pickup") return true;
   if (d.calcing || d.error) return false;
   if (d.name.trim().length < 2) return false;
@@ -1111,7 +1182,7 @@ function deliveryPayload() {
 }
 
 async function submitOrder() {
-  const btn = state.cfg.delivery?.cdek ? $("coSubmit") : $("btnOrder");
+  const btn = $("coSubmit");
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = "…";
   const body = {
@@ -1122,6 +1193,8 @@ async function submitOrder() {
       rotation: Math.round(p.rotation) % 360,
     })),
     delivery: deliveryPayload(),
+    email: state.contact.email.trim().toLowerCase() || null,
+    terms_accepted: state.contact.terms,
   };
   let r, data;
   try {
@@ -1155,17 +1228,22 @@ function showSuccess(data) {
   const where = data.delivery_method === "pickup"
     ? "Заберёшь в поп-апе — пришлём адрес, когда будет готово."
     : `Доставка: ${METHOD_NAMES[data.delivery_method]}. Трек-номер пришлём в чат.`;
+  const receipt = data.receipt_email
+    ? `<br><br>Чек придёт на ${data.receipt_email}.`
+    : "";
   const ov = $("overlay");
   ov.innerHTML = `
     <h2>Заказ принят</h2>
     <div class="num">№${data.order_id}</div>
     <p>Сумма ${data.price} ₽${data.delivery_price ? ` (с доставкой ${data.delivery_price} ₽)` : ""}.
     ${data.pay_url ? "Ссылка на оплату — в чате с ботом." : "Реквизиты для оплаты придут в чат с ботом."}${hold}<br><br>
-    ${where}</p>
+    ${where}${receipt}</p>
+    <p class="fine" id="ovFine"></p>
     <div class="acts">
       ${data.pay_url ? '<button class="order-btn" id="ovPay">Оплатить</button>' : ""}
       <button class="ghost-btn" id="ovClose">Закрыть</button>
     </div>`;
+  $("ovFine").textContent = state.cfg.return_policy?.short || "";
   show(ov);
   const pay = $("ovPay");
   if (pay) pay.onclick = () => {
