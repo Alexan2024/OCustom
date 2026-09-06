@@ -266,6 +266,23 @@ async def fetch_payment(payment_id: str) -> dict:
     return r.json()
 
 
+async def fetch_receipts(payment_id: str) -> list[dict]:
+    """Чеки, пробитые по платежу. GET /v3/receipts?payment_id={id}
+
+    Пустой список значит, что кассе чек не уходил вовсе: либо фискализация
+    выключена на стороне ЮKassa, либо платёж создавался без состава чека.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.get(f"{API_URL}/receipts",
+                                 params={"payment_id": payment_id}, auth=_auth())
+    except httpx.HTTPError as e:
+        raise PaymentError(f"ЮKassa недоступна: {e}") from e
+    if r.status_code >= 400:
+        raise PaymentError(f"ЮKassa вернула {r.status_code}: {r.text[:300]}")
+    return r.json().get("items") or []
+
+
 def _amount_matches(payment: dict, order: dict) -> bool:
     try:
         return abs(float(payment["amount"]["value"]) - float(order["price"])) < 0.01
