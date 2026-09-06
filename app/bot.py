@@ -76,8 +76,13 @@ CUSTOMER_NOTIFY = {
 
 # Для доставки часть сообщений другая: забирать никуда не надо.
 CUSTOMER_NOTIFY_DELIVERY = {
-    "ready": ("Заказ №{id} готов 📦 Упаковали и везём в СДЭК. "
-              "Как только присвоят трек-номер — пришлём его сюда."),
+    # Накладная заводится сразу после оплаты, поэтому трек прилетает человеку
+    # задолго до того, как посылка поедет. Обещать движение тут нельзя —
+    # иначе через день придут спрашивать, почему трекинг пустой.
+    "tracked": ("Заказ №{id}: трек-номер {track}\n{track_url}\n\n"
+                "Сейчас печатаем. Отслеживание оживёт, когда передадим "
+                "посылку в СДЭК — обычно через день-два."),
+    "ready": "Заказ №{id} готов 📦 Упаковали, отвозим в СДЭК.",
     "shipped": "Заказ №{id} уехал 🚚 Отследить: {track_url}",
     "done": "Заказ №{id} вручён. Носи с удовольствием 🖤",
 }
@@ -302,8 +307,7 @@ async def start_deep(m: Message, command: CommandObject):
             if await payments.confirm_payment(o["payment_id"], o):
                 if db.mark_paid(oid, o["payment_id"]):
                     o = db.get_order(oid)
-                    await notify_customer_status(o, "paid")
-                    await refresh_or_send_staff_card(o)
+                    await after_paid(o)
                 return
         except payments.PaymentError as e:
             log.warning("Проверка платежа по заказу №%s не удалась: %s", oid, e)
@@ -587,7 +591,8 @@ def order_card_kb(o: dict) -> InlineKeyboardMarkup | None:
     # Накладную тоже можно перевыпустить руками: СДЭК мог не ответить
     # в момент, когда заказ переводили в «Готово».
     if (o["delivery_method"] != "pickup" and cdek.enabled()
-            and not o.get("cdek_uuid") and o["status"] in ("ready", "shipped")):
+            and not o.get("cdek_uuid")
+            and o["status"] in ("paid", "in_progress", "ready", "shipped")):
         rows.append([InlineKeyboardButton(text="Создать накладную СДЭК ↻",
                                           callback_data=f"cd:{o['id']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
@@ -672,6 +677,42 @@ async def ensure_shipment(o: dict):
     await sync_shipment(o["id"])
 
 
+async def cancel_shipment(o: dict):
+    """Гасит накладную у отменённого заказа.
+
+    Накладную заводим сразу после оплаты, поэтому у отменённого заказа она,
+    скорее всего, уже есть. Если СДЭК её удалить не даст (пакет успели
+    принять) — зовём сотрудника, чтобы отменил руками.
+    """
+    if not o or not o.get("cdek_uuid") or not cdek.enabled():
+        return
+    try:
+        await cdek.delete_shipment(o["cdek_uuid"])
+    except cdek.CdekError as e:
+        log.warning("Накладная по заказу №%s не погасилась: %s", o["id"], e)
+        await alert_staff(
+            f"⚠️ Заказ №{o['id']} отменён, а накладную СДЭК погасить не вышло:\n{e}\n"
+            f"Отмени её руками в ЛК СДЭК: "
+            f"{o.get('cdek_number') or o['cdek_uuid']}")
+        return
+    db.clear_cdek(o["id"])
+    log.info("Накладная по отменённому заказу №%s погашена", o["id"])
+    await alert_staff(f"Заказ №{o['id']} отменён, накладная СДЭК погашена.")
+
+
+async def after_paid(o: dict):
+    """Общий хвост оплаты: и для вебхука, и для возврата человека в бота.
+
+    Накладную заводим здесь же, если CDEK_CREATE_ON_PAID: трек-номер нужен
+    покупателю сразу, а не через день, когда футболку допечатают.
+    """
+    await notify_customer_status(o, "paid")
+    await refresh_or_send_staff_card(o)
+    if (config.CDEK_CREATE_ON_PAID and o["delivery_method"] != "pickup"
+            and cdek.enabled()):
+        asyncio.create_task(_shipment_task(o))
+
+
 async def sync_shipment(oid: int):
     """Спрашивает у СДЭК настоящее состояние накладной и подтягивает его
     в заказ: трек-номер клиенту, статус в карточку, вручение — в 'done'."""
@@ -696,7 +737,9 @@ async def sync_shipment(oid: int):
             "Проверь адрес и телефон получателя, потом жми «Создать накладную СДЭК ↻».")
 
     if info["number"] and not had_number:
-        await notify_customer_status(o, "shipped")
+        # До передачи в СДЭК это ещё не «уехал», а просто присвоенный номер.
+        await notify_customer_status(
+            o, "shipped" if o["status"] == "shipped" else "tracked")
 
     if info["status"] in cdek.DONE_STATUSES and o["status"] not in ("done", "cancelled"):
         db.set_status(oid, "done")
@@ -774,10 +817,28 @@ async def staff_set_status(cb: CallbackQuery):
     await notify_customer_status(o, new_status)
     await cb.answer("Ок")
 
+    # Заказ стал оплаченным (в ручном режиме это делает сотрудник кнопкой) —
+    # заводим накладную, чтобы трек-номер ушёл покупателю сразу.
+    if (new_status == "paid" and config.CDEK_CREATE_ON_PAID
+            and o["delivery_method"] != "pickup"):
+        asyncio.create_task(_shipment_task(o))
     # Готовый заказ с доставкой сразу заводим в СДЭК: сотруднику останется
-    # распечатать наклейку и отнести пакет.
+    # распечатать наклейку и отнести пакет. Если накладную уже завели
+    # при оплате, ensure_shipment просто ничего не сделает.
     if new_status == "ready" and o["delivery_method"] != "pickup":
         asyncio.create_task(_shipment_task(o))
+    # Отменённый заказ не поедет — накладную гасим, чтобы не висела
+    # в договоре.
+    if new_status == "cancelled":
+        asyncio.create_task(_cancel_shipment_task(o))
+
+
+async def _cancel_shipment_task(o: dict):
+    try:
+        await cancel_shipment(o)
+        await refresh_or_send_staff_card(db.get_order(o["id"]))
+    except Exception as e:
+        log.warning("Гашение накладной по заказу №%s упало: %s", o["id"], e)
 
 
 async def _shipment_task(o: dict):
