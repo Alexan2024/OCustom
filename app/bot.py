@@ -154,10 +154,15 @@ async def diag(m: Message):
                      f"{'передаём' if config.YOOKASSA_SEND_RECEIPT else 'выключен'}")
         if config.YOOKASSA_SEND_RECEIPT:
             lines.append(f"  Ставка НДС: код {config.YOOKASSA_VAT_CODE}")
-            lines.append(f"  Способ расчёта: {config.YOOKASSA_PAYMENT_MODE}")
+            lines.append(f"  Способ расчёта: {payments.payment_mode_label()}")
+            lines.append(f"  Позиция в чеке: «{payments.item_name('M')}»")
+            lines.append(f"  Предмет расчёта: {config.RECEIPT_ITEM_SUBJECT}")
             lines.append("  Чек уходит на почту, её спрашиваем при оформлении")
             if config.YOOKASSA_PAYMENT_MODE not in ("full_payment", "full_prepayment"):
                 lines.append("  ❌ ЮKassa знает только full_payment и full_prepayment")
+            if config.RECEIPT_ITEM_SUBJECT not in ("commodity", "service", "work"):
+                lines.append("  ❌ RECEIPT_ITEM_SUBJECT: касса ждёт "
+                             "commodity, service или work")
         try:
             shop = await payments.fetch_shop()
             lines.append(f"  ✅ магазин отвечает, статус «{shop.get('status')}»")
