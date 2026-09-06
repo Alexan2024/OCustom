@@ -537,12 +537,27 @@ def order_by_cdek_uuid(uuid: str) -> dict | None:
     return get_order(row["id"]) if row else None
 
 
+def clear_cdek(oid: int):
+    """Забывает накладную: заказ отменён, посылки не будет. После этого
+    set_cdek_uuid снова сработает, если заказ вдруг оживят."""
+    with conn() as c:
+        c.execute(
+            "UPDATE orders SET cdek_uuid=NULL, cdek_number=NULL,"
+            " cdek_status=NULL, cdek_status_text=NULL WHERE id=?", (oid,)
+        )
+
+
 def active_shipments() -> list[int]:
-    """Заказы, за накладными которых ещё стоит следить."""
+    """Заказы, за накладными которых ещё стоит следить.
+
+    Накладная заводится сразу после оплаты (CDEK_CREATE_ON_PAID), поэтому
+    следить начинаем с 'paid': трек-номер присваивается, пока футболку
+    ещё только печатают.
+    """
     with conn() as c:
         rows = c.execute(
             "SELECT id FROM orders WHERE delivery_method!='pickup' "
             "AND cdek_uuid IS NOT NULL AND cdek_uuid!='' "
-            "AND status IN ('ready','shipped')"
+            "AND status IN ('paid','in_progress','ready','shipped')"
         ).fetchall()
     return [r["id"] for r in rows]
