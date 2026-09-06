@@ -715,7 +715,8 @@ async def after_paid(o: dict):
 
 async def sync_shipment(oid: int):
     """Спрашивает у СДЭК настоящее состояние накладной и подтягивает его
-    в заказ: трек-номер клиенту, статус в карточку, вручение — в 'done'."""
+    в заказ: трек-номер клиенту, статус в карточку, приёмку посылки —
+    в 'shipped', вручение — в 'done'."""
     o = db.get_order(oid)
     if not o or not o.get("cdek_uuid") or not cdek.enabled():
         return
@@ -727,11 +728,27 @@ async def sync_shipment(oid: int):
 
     had_number = bool(o.get("cdek_number"))
     changed = db.set_cdek_state(oid, info["number"], info["status"], info["text"])
-    if not changed:
-        return
     o = db.get_order(oid)
 
-    if info["invalid"]:
+    # СДЭК принял пакет — переводим заказ в «Передан в СДЭК» сами. Кнопку
+    # сотрудник нажимает уже в ПВЗ, с пакетом в одной руке и телефоном
+    # в другой, и забывает об этом чаще, чем хотелось бы. Слово СДЭК тут
+    # достовернее нажатой кнопки: посылка уже физически не у нас.
+    became_shipped = (
+        config.CDEK_AUTO_SHIPPED
+        and cdek.looks_shipped(info)
+        and o["status"] in ("paid", "in_progress", "ready")
+    )
+    if became_shipped:
+        db.set_status(oid, "shipped")
+        o = db.get_order(oid)
+        log.info("Заказ №%s: СДЭК принял посылку (%s) — статус «передан в доставку»",
+                 oid, info["status"] or "—")
+
+    if not (changed or became_shipped):
+        return
+
+    if changed and info["invalid"]:
         await alert_staff(
             f"⚠️ СДЭК отклонил накладную по заказу №{oid}: {info['error']}\n"
             "Проверь адрес и телефон получателя, потом жми «Создать накладную СДЭК ↻».")
@@ -740,12 +757,19 @@ async def sync_shipment(oid: int):
         # До передачи в СДЭК это ещё не «уехал», а просто присвоенный номер.
         await notify_customer_status(
             o, "shipped" if o["status"] == "shipped" else "tracked")
+    elif became_shipped:
+        await notify_customer_status(o, "shipped")
+
+    if became_shipped:
+        await alert_staff(
+            f"🚚 Заказ №{oid}: СДЭК принял посылку — «{info['text'] or 'в пути'}». "
+            "Статус сменился сам, «Сдал в СДЭК» нажимать не нужно.")
 
     if info["status"] in cdek.DONE_STATUSES and o["status"] not in ("done", "cancelled"):
         db.set_status(oid, "done")
         o = db.get_order(oid)
         await notify_customer_status(o, "done")
-    elif info["status"] in cdek.ALERT_STATUSES:
+    elif changed and info["status"] in cdek.ALERT_STATUSES:
         await alert_staff(
             f"⚠️ Заказ №{oid}: СДЭК сообщает «{info['text']}». Нужен человек.")
 
