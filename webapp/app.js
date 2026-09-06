@@ -553,8 +553,7 @@ function refreshFlags() {
     hint.className = "hint warn";
   } else {
     hint.textContent = state.view === "sleeves"
-      ? `Кладём на ${SIDE_NAMES[state.target]} — тапни другой, чтобы переключить. ` +
-        "Левый и правый — как на человеке."
+      ? `Кладём на ${SIDE_NAMES[state.target]} — тапни другой, чтобы переключить.`
       : "Тапни принт, чтобы повернуть или убрать. Уголок ⟲ — свободный поворот.";
     hint.className = "hint";
   }
