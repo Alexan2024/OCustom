@@ -193,9 +193,112 @@ async def diag(m: Message):
     quota = (f"{db.orders_today()} из {config.ONLINE_QUOTA_PER_DAY}"
              if config.quota_enabled()
              else f"{db.orders_today()} (дневная квота выключена)")
+    blanks = " · ".join(f"{s} {n}" for s, n in db.shirt_stock().items())
     lines += ["", f"Мини-апп: {config.WEBAPP_URL}/webapp/",
-              f"Заказов сегодня: {quota}"]
+              f"Заказов сегодня: {quota}",
+              f"Бланки: {blanks} (правится командой /stock)"]
     await m.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+# ---------- Остаток бланков ----------
+
+# Шаги кнопок в панели. ±1 — обычная продажа мимо мини-аппа, ±5 — привезли
+# пачку. Точное число ставится командой, кнопками до сорока штук не долистать.
+STOCK_STEPS = (-5, -1, 1, 5)
+
+
+def stock_text() -> str:
+    lines = ["👕 Бланки на складе", ""]
+    for size, n in db.shirt_stock().items():
+        if n <= 0:
+            mark, tail = "❌", " — размер скрыт в мини-аппе"
+        elif n <= config.SHIRT_STOCK_LOW:
+            mark, tail = "⚠️", " — заканчивается"
+        else:
+            mark, tail = "•", ""
+        lines.append(f"{mark} {size}: {n} шт.{tail}")
+    lines.append("")
+    if config.SHIRT_STOCK_AUTO:
+        lines.append("Заказ через мини-апп списывает бланк сам, отмена — возвращает.")
+    else:
+        lines.append("Автосписание выключено (SHIRT_STOCK_AUTO=false): "
+                     "остаток меняется только руками.")
+    lines.append("Точное число: /stock M 20")
+    return "\n".join(lines)
+
+
+def stock_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for size, n in db.shirt_stock().items():
+        row = []
+        labelled = False
+        for step in STOCK_STEPS:
+            if step > 0 and not labelled:
+                # Само число — посередине ряда, между «отнять» и «прибавить».
+                # Кнопка неактивная: нажатие просто перерисовывает панель.
+                row.append(InlineKeyboardButton(
+                    text=f"{size}: {n}", callback_data="stk:-:0"))
+                labelled = True
+            row.append(InlineKeyboardButton(
+                text=f"{step:+d}", callback_data=f"stk:{size}:{step}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Обновить ↻", callback_data="stk:-:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("stock"))
+async def stock_cmd(m: Message, command: CommandObject):
+    """/stock — панель с кнопками. /stock M 20 — поставить точное число.
+    /stock M +5 — прибавить. Работает только в чате сотрудников."""
+    if config.STAFF_CHAT_ID and m.chat.id != config.STAFF_CHAT_ID:
+        return
+    args = (command.args or "").split()
+    if not args:
+        await m.answer(stock_text(), reply_markup=stock_kb())
+        return
+
+    size = args[0].upper()
+    if size not in config.SIZES:
+        await m.answer("Такого размера нет. Есть: " + ", ".join(config.SIZES))
+        return
+    if len(args) < 2:
+        await m.answer(f"Сколько бланков {size}? Например: /stock {size} 20")
+        return
+    raw = args[1]
+    try:
+        if raw[0] in "+-":
+            was = db.shirt_stock_of(size)
+            now = db.add_shirt_stock(size, int(raw))
+        else:
+            was = db.shirt_stock_of(size)
+            now = db.set_shirt_stock(size, int(raw))
+    except ValueError:
+        await m.answer("Второе слово — число: /stock M 20 или /stock M +5")
+        return
+    log.info("Остаток бланков %s: %d → %d (@%s)", size, was, now,
+             m.from_user.username or m.from_user.id)
+    await m.answer(stock_text(), reply_markup=stock_kb())
+
+
+@dp.callback_query(F.data.startswith("stk:"))
+async def staff_stock_edit(cb: CallbackQuery):
+    """Кнопки панели остатков. Считает база, а не бот: по кнопкам в общем
+    чате жмут вдвоём, и «прочитал — сложил — записал» теряло бы нажатия."""
+    if config.STAFF_CHAT_ID and cb.message.chat.id != config.STAFF_CHAT_ID:
+        await cb.answer()
+        return
+    _, size, delta = cb.data.split(":")
+    if size in config.SIZES and delta not in ("0", ""):
+        now = db.add_shirt_stock(size, int(delta))
+        log.info("Остаток бланков %s → %d (@%s)", size, now,
+                 cb.from_user.username or cb.from_user.id)
+        await cb.answer(f"{size}: {now} шт.")
+    else:
+        await cb.answer()
+    try:
+        await cb.message.edit_text(stock_text(), reply_markup=stock_kb())
+    except Exception:
+        pass   # «message is not modified» — жали кнопку, ничего не изменилось
 
 
 @dp.message(Command("receipt"))
