@@ -416,8 +416,7 @@ async def yookassa_webhook(request: Request):
         return {"ok": True}
 
     order = db.get_order(order["id"])
-    await tgbot.notify_customer_status(order, "paid")
-    await tgbot.refresh_or_send_staff_card(order)
+    await tgbot.after_paid(order)
     return {"ok": True}
 
 
