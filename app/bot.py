@@ -193,6 +193,87 @@ async def diag(m: Message):
     await m.answer("\n".join(lines), disable_web_page_preview=True)
 
 
+@dp.message(Command("receipt"))
+async def receipt_check(m: Message, command: CommandObject):
+    """/receipt 42 — что случилось с чеком по заказу.
+
+    Отвечает на единственный вопрос, который возникает, когда покупатель
+    говорит «чек не пришёл»: дошёл ли чек до кассы и на какой адрес его
+    отправляли. Работает только в чате сотрудников.
+    """
+    if config.STAFF_CHAT_ID and m.chat.id != config.STAFF_CHAT_ID:
+        return
+    try:
+        oid = int((command.args or "").strip())
+    except ValueError:
+        await m.answer("Напиши номер заказа: /receipt 42")
+        return
+
+    o = db.get_order(oid)
+    if not o:
+        await m.answer(f"Заказа №{oid} нет в базе.")
+        return
+
+    lines = [f"🧾 Чек по заказу №{oid}", ""]
+    lines.append(f"Статус заказа: {STATUS_LABELS.get(o['status'], o['status'])}")
+    lines.append(f"Почта в заказе: {o.get('email') or '— не указана'}")
+    if o.get("phone"):
+        lines.append(f"Телефон в заказе: {o['phone']}")
+    lines.append(f"Чек 54-ФЗ: "
+                 f"{'передаём' if config.YOOKASSA_SEND_RECEIPT else 'ВЫКЛЮЧЕН'}")
+
+    if not config.YOOKASSA_SEND_RECEIPT:
+        lines.append("")
+        lines.append("Чек не пробивался: YOOKASSA_SEND_RECEIPT=false на Railway. "
+                     "Пока флаг выключен, ни один чек не уйдёт.")
+        await m.answer("\n".join(lines))
+        return
+
+    if not o.get("payment_id"):
+        lines.append("")
+        lines.append("Платежа нет: ссылка на оплату не выпускалась, "
+                     "либо оплату принимали вручную. Чеку взяться неоткуда.")
+        await m.answer("\n".join(lines))
+        return
+
+    lines.append(f"Платёж: {o['payment_id']}")
+    try:
+        payment = await payments.fetch_payment(o["payment_id"])
+        receipts = await payments.fetch_receipts(o["payment_id"])
+    except payments.PaymentError as e:
+        lines += ["", f"❌ {e}"]
+        await m.answer("\n".join(lines))
+        return
+
+    lines.append(f"Статус платежа: {payment.get('status')}")
+    reg = payment.get("receipt_registration")
+    lines.append(f"Регистрация чека: {reg or '— поля нет в ответе'}")
+    lines.append(f"Чеков в ЮKassa: {len(receipts)}")
+    for r in receipts:
+        lines.append(f"  • {r.get('type')} — {r.get('status')}")
+
+    lines.append("")
+    if payment.get("status") != "succeeded":
+        lines.append("Платёж не завершён. Чек пробивается только после оплаты — "
+                     "возможно, покупатель до конца не дошёл.")
+    elif reg == "succeeded" or any(r.get("status") == "succeeded" for r in receipts):
+        lines.append("Чек пробит и ушёл в ОФД. Дальше письмо отправляет ОФД, "
+                     "а не мы: пусть покупатель посмотрит папку «Спам» и "
+                     "проверит, верно ли записан адрес выше. Если письма нет "
+                     "и там — вопрос к Паше, включена ли у ОФД отправка "
+                     "на e-mail.")
+    elif reg == "pending":
+        lines.append("Касса ещё не пробила чек. Обычно это минуты; если висит "
+                     "дольше — Паше стоит посмотреть очередь в Атоле.")
+    elif reg == "canceled":
+        lines.append("Касса отклонила чек. Причина видна в ЛК ЮKassa, раздел "
+                     "«Чеки». Чаще всего это НДС или СНО — их показывает /diag.")
+    else:
+        lines.append("Чек до кассы не дошёл. Проверь /diag: похоже, "
+                     "фискализация в ЮKassa не включена.")
+    await m.answer("\n".join(lines), disable_web_page_preview=True)
+
+
 @dp.message(CommandStart(deep_link=True))
 async def start_deep(m: Message, command: CommandObject):
     """Возврат со страницы оплаты: /start paid_42."""
