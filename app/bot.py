@@ -8,8 +8,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats,
                            BufferedInputFile, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup,
-                           KeyboardButton, Message, ReplyKeyboardMarkup,
-                           ReplyKeyboardRemove, WebAppInfo)
+                           Message, WebAppInfo)
 
 from . import cdek, config, db, payments, render
 
@@ -91,11 +90,12 @@ def webapp_button(text="Собрать футболку 👕", path="/webapp/"):
 
 
 def start_kb():
-    """Кнопки под приветствием: конструктор и свои заказы."""
+    """Кнопки под приветствием: конструктор, свои заказы, условия."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Собрать футболку 👕",
                               web_app=WebAppInfo(url=config.WEBAPP_URL + "/webapp/"))],
         [InlineKeyboardButton(text="Мои заказы 🧾", callback_data="my:list")],
+        [InlineKeyboardButton(text="Условия возврата ⚖️", callback_data="terms")],
     ])
 
 
@@ -104,18 +104,12 @@ async def setup_commands():
     try:
         await bot.set_my_commands(
             [BotCommand(command="start", description="Собрать футболку"),
-             BotCommand(command="orders", description="Мои заказы")],
+             BotCommand(command="orders", description="Мои заказы"),
+             BotCommand(command="terms", description="Условия возврата")],
             scope=BotCommandScopeAllPrivateChats(),
         )
     except Exception as e:
         log.warning("Не удалось установить меню команд: %s", e)
-
-
-def phone_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
-        resize_keyboard=True, one_time_keyboard=True,
-    )
 
 
 # ---------- Команды ----------
@@ -156,6 +150,7 @@ async def diag(m: Message):
         if config.YOOKASSA_SEND_RECEIPT:
             lines.append(f"  Ставка НДС: код {config.YOOKASSA_VAT_CODE}")
             lines.append(f"  Способ расчёта: {config.YOOKASSA_PAYMENT_MODE}")
+            lines.append("  Чек уходит на почту, её спрашиваем при оформлении")
             if config.YOOKASSA_PAYMENT_MODE not in ("full_payment", "full_prepayment"):
                 lines.append("  ❌ ЮKassa знает только full_payment и full_prepayment")
         try:
@@ -250,35 +245,24 @@ async def start(m: Message):
         f"🕐 Храним готовый заказ {config.PICKUP_HOLD_DAYS} дней.",
         reply_markup=start_kb(),
     )
-    if config.YOOKASSA_SEND_RECEIPT and not db.get_phone(m.from_user.id):
-        await ask_phone(m.from_user.id)
 
 
-async def ask_phone(user_id: int):
-    await bot.send_message(
-        user_id,
-        "Ещё одно: для чека нужен номер телефона — туда придёт электронный чек "
-        "после оплаты. Жми кнопку внизу, вводить ничего не надо.",
-        reply_markup=phone_keyboard(),
-    )
+# ---------- Условия возврата ----------
+
+# Тот же текст покупатель видит и подтверждает галочкой на экране оформления;
+# здесь он лежит, чтобы к нему можно было вернуться после покупки.
+TERMS_TEXT = f"⚖️ Условия возврата\n\n{config.RETURN_POLICY_TEXT}"
 
 
-async def ask_phone_safe(user_id: int):
-    try:
-        await ask_phone(user_id)
-    except Exception as e:
-        log.warning("Не удалось запросить телефон у %s: %s", user_id, e)
+@dp.message(Command("terms"))
+async def terms(m: Message):
+    await m.answer(TERMS_TEXT)
 
 
-@dp.message(F.contact)
-async def got_contact(m: Message):
-    if m.contact.user_id and m.contact.user_id != m.from_user.id:
-        await m.answer("Нужен твой номер, а не чужой контакт.",
-                       reply_markup=phone_keyboard())
-        return
-    db.set_phone(m.from_user.id, m.contact.phone_number)
-    await m.answer("Записал, спасибо. Возвращайся в конструктор 👕",
-                   reply_markup=ReplyKeyboardRemove())
+@dp.callback_query(F.data == "terms")
+async def cb_terms(cb: CallbackQuery):
+    await cb.answer()
+    await bot.send_message(cb.message.chat.id, TERMS_TEXT)
 
 
 # ---------- Мои заказы: карточка для покупателя ----------
@@ -490,6 +474,8 @@ def order_card_text(o: dict) -> str:
     ]
     if o.get("phone"):
         lines.append(f"Телефон: {o['phone']}")
+    if o.get("email"):
+        lines.append(f"Почта (чек): {o['email']}")
     sum_line = f"Размер: {o['size']}  |  Сумма: {o['price']} ₽"
     if o.get("delivery_price"):
         sum_line += f" ({goods} + {o['delivery_price']} доставка)"
