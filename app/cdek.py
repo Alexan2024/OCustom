@@ -16,6 +16,7 @@
 """
 import asyncio
 import logging
+import math
 import time
 
 import httpx
@@ -255,9 +256,17 @@ def _package_body() -> dict:
     }
 
 
-async def calc(method: str, city_code: int) -> dict:
-    """Стоимость и срок доставки. Цену округляем вверх до рубля и добавляем
-    наценку — упаковка и время сотрудника тоже чего-то стоят."""
+def fixed_price(method: str) -> int | None:
+    """Фиксированная цена доставки для способа получения.
+
+    None — фиксированной цены нет, считаем по тарифу СДЭК.
+    """
+    v = config.CDEK_PRICE_DOOR if method == "cdek_door" else config.CDEK_PRICE_PVZ
+    return v if v > 0 else None
+
+
+async def _tariff(method: str, city_code: int) -> dict:
+    """Сырой ответ калькулятора СДЭК."""
     data = await _call("POST", "/calculator/tariff", json={
         "type": 1,
         "tariff_code": tariff_code(method),
@@ -268,18 +277,44 @@ async def calc(method: str, city_code: int) -> dict:
     err = _errors(data)
     if err:
         raise CdekError(err)
+    return data
+
+
+def _period(data: dict) -> dict:
+    return {"period_min": data.get("period_min"),
+            "period_max": data.get("period_max")}
+
+
+async def calc(method: str, city_code: int) -> dict:
+    """Стоимость и срок доставки.
+
+    Цена фиксированная — одна на все направления (CDEK_PRICE_PVZ /
+    CDEK_PRICE_DOOR). Калькулятор СДЭК при этом всё равно спрашиваем, но
+    только ради срока: если он не ответил, показываем цену без срока, а не
+    роняем оформление заказа. Цена от направления не зависит, значит и от
+    доступности калькулятора зависеть не должна.
+
+    Если фиксированная цена выключена (0), возвращаемся к тарифу СДЭК:
+    округляем вверх до рубля и добавляем наценку — упаковка и время
+    сотрудника тоже чего-то стоят.
+    """
+    fixed = fixed_price(method)
+    if fixed is not None:
+        try:
+            data = await _tariff(method, city_code)
+        except CdekError as e:
+            log.warning("Срок доставки не узнали (%s) — покажем цену без срока", e)
+            return {"price": fixed, "period_min": None, "period_max": None}
+        return {"price": fixed, **_period(data)}
+
+    data = await _tariff(method, city_code)
     raw = data.get("total_sum")
     if raw is None:
         raw = data.get("delivery_sum")
     if raw is None:
         raise CdekError("СДЭК не вернул стоимость доставки")
-    import math
     price = int(math.ceil(float(raw))) + config.DELIVERY_MARKUP_RUB
-    return {
-        "price": max(0, price),
-        "period_min": data.get("period_min"),
-        "period_max": data.get("period_max"),
-    }
+    return {"price": max(0, price), **_period(data)}
 
 
 async def price_for(order_like: dict) -> int:
@@ -420,6 +455,16 @@ async def check() -> list[str]:
     out = []
     await _access_token()
     out.append("✅ ключи приняты")
+
+    pvz, door = fixed_price("cdek_pvz"), fixed_price("cdek_door")
+    if pvz and door:
+        out.append(f"✅ цена доставки фиксированная: ПВЗ {pvz} ₽, курьер {door} ₽")
+    elif pvz or door:
+        out.append(f"⚠️ фиксирована цена только у одного способа: "
+                   f"ПВЗ {pvz or 'по тарифу'}, курьер {door or 'по тарифу'}")
+    else:
+        out.append("ℹ️ цена доставки считается по тарифу СДЭК")
+
     code = config.CDEK_SHIPMENT_POINT
     if not code:
         out.append("❌ CDEK_SHIPMENT_POINT не задан — накладные не создаются")
