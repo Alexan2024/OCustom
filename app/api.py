@@ -35,6 +35,7 @@ def get_config():
             for s, geo in config.SIZES.items()
         },
         "photo": {**config.SHIRT_PHOTO, "stretch_y": config.PHOTO_STRETCH_Y},
+        "shirt_color": config.SHIRT_COLOR,
         "min_gap_mm": config.MIN_GAP_MM,
         "base_price": config.BASE_PRICE,
         "included_prints": config.INCLUDED_PRINTS,
