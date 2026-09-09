@@ -31,7 +31,10 @@ const SIDE_NAMES = {
   sleeve_l: "левый рукав", sleeve_r: "правый рукав",
 };
 const SIDE_SHORT = { front: "пер", back: "спн", sleeve_l: "лев", sleeve_r: "прв" };
-const SLEEVE_SPLIT_MM = 60;   // просвет между схемами рукавов на экране
+// Просвет между схемами рукавов. Схема стала шире (весь рукав, а не одна
+// зона), и место в этой строке дороже: у схем есть собственный контур,
+// поэтому большой зазор им больше не нужен.
+const SLEEVE_SPLIT_MM = 30;
 const SNAP_DEG = 5;           // магнит поворота к 0/90/180/270
 const STOCK_POLL_MS = 45000;  // как часто переспрашиваем остатки
 
@@ -161,6 +164,11 @@ async function boot() {
     return;
   }
   state.cfg = cfg; state.stickers = stickers;
+  // Цвет бланка живёт в config.py (SHIRT_COLOR): им заливается схема рукава.
+  // Ставим до ветки на bootView — карточка заказа рисуется тем же кодом.
+  if (cfg.shirt_color) {
+    document.documentElement.style.setProperty("--shirt", cfg.shirt_color);
+  }
   const params = new URLSearchParams(location.search);
   if (params.get("view")) return bootView(params.get("view"), params.get("key"));
 
@@ -369,11 +377,16 @@ function layoutBody(availW, availH) {
 
 function layoutSleeves(availW, availH) {
   // Рукав показываем схемой, а не фотографией: на фронтальном кадре он уходит
-  // под углом и укорочен, и миллиметры по нему врали бы.
+  // под углом и укорочен, и миллиметры по нему врали бы. Схема — весь рукав
+  // целиком (sleeve_w_mm × sleeve_mm), залитый цветом бланка; печатная зона
+  // лежит внутри него с теми же отступами, что считает config.zone().
+  // Голый прямоугольник зоны на светлом фоне не читался вовсе.
+  const g = state.cfg.sizes[state.size];
   const z = zoneOf("sleeve_l");
+  const sw = g.sleeve_w_mm, sh = g.sleeve_mm;
   state.ppm = Math.min(
-    availW / (z.w_mm * 2 + SLEEVE_SPLIT_MM),
-    (availH - 46) / z.h_mm,
+    availW / (sw * 2 + SLEEVE_SPLIT_MM),
+    (availH - 46) / sh,
   );
   const wrap = document.createElement("div");
   wrap.className = "sleeve-wrap";
@@ -384,10 +397,27 @@ function layoutSleeves(availW, availH) {
     const lab = document.createElement("div");
     lab.className = "sleeve-label";
     lab.textContent = side === "sleeve_l" ? "Левый" : "Правый";
+
+    const shape = document.createElement("div");
+    shape.className = "sleeve-shape";
+    shape.style.width = sw * state.ppm + "px";
+    shape.style.height = sh * state.ppm + "px";
+    // Тычок по ткани мимо зоны выбирает этот рукав — иначе поле вокруг зоны
+    // оказалось бы мёртвым, хотя выглядит как часть схемы.
+    shape.addEventListener("pointerdown", (e) => {
+      if (e.target !== shape) return;
+      state.sel = null;
+      if (!state.viewMode && state.target !== side) { state.target = side; layoutRefresh(); }
+      else refreshFlags();
+    });
+
     const el = makeZone(side);
-    el.classList.add("static");
+    el.style.left = (sw - z.w_mm) / 2 * state.ppm + "px";
+    el.style.top = z.top_mm * state.ppm + "px";
+    shape.appendChild(el);
+
     block.appendChild(lab);
-    block.appendChild(el);
+    block.appendChild(shape);
     wrap.appendChild(block);
   }
   $("stage").appendChild(wrap);
