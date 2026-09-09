@@ -10,7 +10,7 @@ from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats,
                            InlineKeyboardButton, InlineKeyboardMarkup,
                            Message, WebAppInfo)
 
-from . import cdek, config, db, payments, render
+from . import assets, cdek, config, db, payments, render
 
 log = logging.getLogger("bot")
 
@@ -89,9 +89,21 @@ CUSTOMER_NOTIFY_DELIVERY = {
 }
 
 
+def webapp_url(path: str = "/webapp/") -> str:
+    """Адрес мини-аппа с номером сборки.
+
+    Telegram кэширует страницу по адресу, поэтому после деплоя адрес обязан
+    измениться — иначе часть людей продолжает открывать прошлую версию,
+    пока их кэш не протухнет сам. Номер считает assets.build() от
+    содержимого файлов мини-аппа, руками его трогать не нужно.
+    """
+    sep = "&" if "?" in path else "?"
+    return f"{config.WEBAPP_URL}{path}{sep}b={assets.build()}"
+
+
 def webapp_button(text="Собрать футболку 👕", path="/webapp/"):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=text, web_app=WebAppInfo(url=config.WEBAPP_URL + path))
+        InlineKeyboardButton(text=text, web_app=WebAppInfo(url=webapp_url(path)))
     ]])
 
 
@@ -99,7 +111,7 @@ def start_kb():
     """Кнопки под приветствием: конструктор, свои заказы, условия."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Собрать футболку 👕",
-                              web_app=WebAppInfo(url=config.WEBAPP_URL + "/webapp/"))],
+                              web_app=WebAppInfo(url=webapp_url()))],
         [InlineKeyboardButton(text="Мои заказы 🧾", callback_data="my:list")],
         [InlineKeyboardButton(text="Условия возврата ⚖️", callback_data="terms")],
     ])
@@ -201,6 +213,7 @@ async def diag(m: Message):
              else f"{db.orders_today()} (дневная квота выключена)")
     blanks = " · ".join(f"{s} {n}" for s, n in db.shirt_stock().items())
     lines += ["", f"Мини-апп: {config.WEBAPP_URL}/webapp/",
+              f"Сборка мини-аппа: {assets.build()}",
               f"Заказов сегодня: {quota}",
               f"Бланки: {blanks} (правится командой /stock)"]
     await m.answer("\n".join(lines), disable_web_page_preview=True)
@@ -685,7 +698,8 @@ def order_card_text(o: dict) -> str:
         for i in items:
             lines.append(_placement_line(i, side))
     lines.append("")
-    lines.append(f"👁 Раскладка: {config.WEBAPP_URL}/webapp/?view={o['id']}&key={o['view_token']}")
+    lines.append("👁 Раскладка: "
+                 + webapp_url(f"/webapp/?view={o['id']}&key={o['view_token']}"))
     return "\n".join(lines)
 
 
