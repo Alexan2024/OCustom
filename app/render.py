@@ -31,6 +31,20 @@ MAX_TOTAL_W = 1280        # шире Telegram всё равно ужмёт
 _font_cache: dict[int, ImageFont.ImageFont] = {}
 
 
+def _shirt_rgba() -> tuple:
+    """Цвет бланка из SHIRT_COLOR. Мусор в переменной не должен ронять
+    картинку заказа — на этот случай белый."""
+    s = (config.SHIRT_COLOR or "").strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return (255, 255, 255, 255)
+    try:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), 255)
+    except ValueError:
+        return (255, 255, 255, 255)
+
+
 def _font(size: int):
     if size in _font_cache:
         return _font_cache[size]
@@ -115,22 +129,33 @@ def _body_panel(size: str, side: str, items: list) -> Image.Image:
 
 
 def _sleeve_panel(size: str, side: str, items: list, ppm: float) -> Image.Image:
+    """Рукав целиком, как в мини-аппе: поле цвета бланка, печатная зона внутри.
+    Одна зона сама по себе на бумажном фоне не читалась рукавом."""
+    g = config.SIZES[size]
     z = config.zone(size, side)
+    sw = max(1, int(round(g["sleeve_w_mm"] * ppm)))
+    sh = max(1, int(round(g["sleeve_mm"] * ppm)))
     w = max(1, int(round(z["w_mm"] * ppm)))
     h = max(1, int(round(z["h_mm"] * ppm)))
     label = "ЛЕВЫЙ РУКАВ" if side == "sleeve_l" else "ПРАВЫЙ РУКАВ"
     font = _font(19)
     # Панель не уже подписи, иначе «ЛЕВЫЙ РУКАВ» обрежется по краю
     label_w = int(round(font.getlength(label))) if hasattr(font, "getlength") else len(label) * 10
-    # Поля вокруг зоны: повёрнутый принт может высунуться за пунктир,
+    # Поля вокруг рукава: повёрнутый принт может высунуться за пунктир,
     # и это должно быть видно, а не обрезаться краем панели.
     m = 34
-    panel_w = max(w + m * 2, label_w + 4)
-    panel = Image.new("RGBA", (panel_w, h + m * 2 + LABEL_H), (0, 0, 0, 0))
+    panel_w = max(sw + m * 2, label_w + 4)
+    panel = Image.new("RGBA", (panel_w, sh + m * 2 + LABEL_H), (0, 0, 0, 0))
     d = ImageDraw.Draw(panel)
-    x0 = (panel_w - w) // 2
-    y0 = LABEL_H + m
+
+    sx = (panel_w - sw) // 2
+    sy = LABEL_H + m
+    d.rectangle([sx, sy, sx + sw - 1, sy + sh - 1], fill=_shirt_rgba(), outline=LINE, width=2)
+
+    x0 = sx + (sw - w) // 2
+    y0 = sy + int(round(z["top_mm"] * ppm))
     d.rectangle([x0 - 1, y0 - 1, x0 + w, y0 + h], outline=LINE, width=2)
+
     _paste_prints(panel, items, ppm, x0, y0, z["w_mm"])
     d.text((0, 4), label, font=font, fill=MUTED)
     return panel
