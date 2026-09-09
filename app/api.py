@@ -3,11 +3,11 @@ import asyncio
 import logging
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, bot as tgbot, cdek, config, db, payments
+from . import assets, auth, bot as tgbot, cdek, config, db, payments
 
 log = logging.getLogger("api")
 app = FastAPI(title=f"{config.BRAND} custom station")
@@ -484,5 +484,57 @@ def root():
     return RedirectResponse("/webapp/")
 
 
-app.mount("/stickers", StaticFiles(directory=config.STICKERS_DIR), name="stickers")
-app.mount("/webapp", StaticFiles(directory=config.BASE_DIR / "webapp", html=True), name="webapp")
+# ---------- Статика мини-аппа ----------
+
+# index.html не кэшируем вовсе. Он маленький, а внутри него лежат ссылки
+# на app.js и styles.css с номером сборки — если WebView Telegram придержит
+# у себя старый index.html, человек так и останется на прошлой версии,
+# сколько бы раз мы ни выкатили новую.
+NO_STORE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
+@app.get("/webapp/", response_class=HTMLResponse)
+@app.get("/webapp/index.html", response_class=HTMLResponse)
+def webapp_index():
+    """Страница мини-аппа с проставленной версией статики."""
+    return HTMLResponse(assets.index_html(), headers=NO_STORE)
+
+
+@app.get("/api/version")
+def api_version():
+    """Номер текущей сборки. Пригодится в /diag и при разборе жалоб
+    «у меня старая версия»."""
+    return JSONResponse({"build": assets.build()}, headers=NO_STORE)
+
+
+class CachedStatic(StaticFiles):
+    """StaticFiles с внятными заголовками кэша.
+
+    Правило простое: адрес с версией (`?v=…`) можно держать вечно — при
+    изменении файла меняется и адрес. Всё остальное живёт час: картинку
+    бланка или принта иногда подменяют под тем же именем.
+    """
+
+    def __init__(self, *args, max_age: int = 3600, **kwargs):
+        self.max_age = max_age
+        super().__init__(*args, **kwargs)
+
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        if path.endswith((".html", ".htm")):
+            resp.headers.update(NO_STORE)
+        elif b"v=" in scope.get("query_string", b""):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            resp.headers["Cache-Control"] = f"public, max-age={self.max_age}"
+        return resp
+
+
+app.mount("/stickers", CachedStatic(directory=config.STICKERS_DIR), name="stickers")
+app.mount("/webapp",
+          CachedStatic(directory=config.BASE_DIR / "webapp", html=True),
+          name="webapp")
