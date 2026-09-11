@@ -6,8 +6,14 @@
    y — вниз от проймы. Сторон четыре: front, back, sleeve_l, sleeve_r.
 
    Поворот свободный, 0..359°. Габарит, по которому принт удерживается
-   в зоне, всегда неповёрнутый: на промежуточных углах углы принта могут
-   выйти за пунктир. Так же считает и сервер — правило одно на обе стороны.
+   в зоне и держит просвет до соседа, поворачивается вместе с ним: это
+   описанный вокруг повёрнутого принта прямоугольник. Угол, при котором
+   принт в зону не влезает, выставить нельзя — поворот упирается в рамку.
+   Так же считает и сервер — правило одно на обе стороны.
+
+   Футболку можно приблизить: щипком по пустому месту, двойным тапом или
+   кнопками сбоку. Приближение — CSS-трансформация сцены (state.cam),
+   миллиметры и разметка от него не меняются.
 
    Второй экран — оформление: способ получения, получатель, доставка.
    Цену доставки здесь только показываем; при создании заказа сервер
@@ -37,6 +43,11 @@ const SIDE_SHORT = { front: "пер", back: "спн", sleeve_l: "лев", sleeve
 const SLEEVE_SPLIT_MM = 30;
 const SNAP_DEG = 5;           // магнит поворота к 0/90/180/270
 const STOCK_POLL_MS = 45000;  // как часто переспрашиваем остатки
+const ZOOM_MAX = 4;           // во сколько раз можно приблизить футболку
+const ZOOM_STEP = 1.6;        // шаг кнопок «+» и «−»
+const ZOOM_TAP = 2.5;         // куда приближает двойной тап
+const TAP_SLOP = 8;           // px: сдвиг пальца, после которого это уже не тап
+const DOUBLE_TAP_MS = 300;
 
 const METHOD_NAMES = {
   pickup: "Самовывоз",
@@ -51,7 +62,8 @@ const state = {
   target: "front",     // куда кладём следующий принт
   placed: [],          // {uid, s, side, x_mm, y_mm, rotation}
   sel: null,
-  ppm: 1,              // px per mm
+  ppm: 1,              // px per mm при приближении 1×
+  cam: { z: 1, x: 0, y: 0 },   // приближение и сдвиг сцены, px экрана
   zoneEls: {},         // side -> DOM-узел зоны, живёт до следующего layout()
   viewMode: false,
   preview: false,      // «как выглядит»: без сетки и подписей
@@ -279,7 +291,9 @@ function wontFit(size) {
   if (!zs) return [];
   return state.placed.filter(p => {
     const z = zs[p.side];
-    return !z || p.s.width_mm > z.w_mm || p.s.height_mm > z.h_mm;
+    if (!z) return true;
+    const [hw, hh] = halfDims(p);
+    return hw * 2 > z.w_mm + 0.01 || hh * 2 > z.h_mm + 0.01;
   });
 }
 
@@ -294,6 +308,7 @@ function setSize(s) {
       dropped.map(p => p.s.name).join(", "), { warn: true });
   }
   state.placed.forEach(clamp);
+  resetCam();
   renderSizes(); layout(); renderAll(); renderCatalog(); haptic();
 }
 
@@ -312,12 +327,8 @@ function makeZone(side) {
   el.style.setProperty("--tick", (50 * state.ppm) + "px");   // риска = 50 мм
   el.innerHTML = `<div class="zone-center"></div>
     <div class="zone-tag">зона ${Math.round(z.w_mm)}×${Math.round(z.h_mm)} мм</div>`;
-  el.addEventListener("pointerdown", (e) => {
-    if (e.target !== el && !e.target.classList.contains("zone-center")) return;
-    state.sel = null;
-    if (!state.viewMode && state.target !== side) { state.target = side; layoutRefresh(); }
-    else refreshFlags();
-  });
+  // Тап по пустой зоне ловит сцена (stageTap): на pointerdown здесь было бы
+  // рано — палец может оказаться началом сдвига приближённой футболки.
   state.zoneEls[side] = el;
   return el;
 }
@@ -326,6 +337,11 @@ function layout() {
   const stage = $("stage");
   stage.innerHTML = "";
   state.zoneEls = {};
+  // Всё содержимое сцены живёт в «камере»: её трансформация и есть зум
+  const cam = document.createElement("div");
+  cam.className = "cam";
+  cam.id = "cam";
+  stage.appendChild(cam);
   // Список принтов занимает полосу справа — сцена должна её учесть
   const withLayers = !state.preview && state.placed.length > 0;
   document.body.classList.toggle("has-layers", withLayers);
@@ -334,6 +350,7 @@ function layout() {
   if (availW <= 0 || availH <= 0) return;
   if (state.view === "sleeves") layoutSleeves(availW, availH);
   else layoutBody(availW, availH);
+  applyCam();
 }
 
 /* Пересобрать сцену и вернуть стикеры на место (после смены цели/поворота) */
@@ -372,7 +389,7 @@ function layoutBody(availW, availH) {
   el.style.left = (centerX - z.w_mm * state.ppm / 2) + "px";
   el.style.top = (shirtH * ph.shoulder_y / ph.h_px + z.top_mm * state.ppm) + "px";
   shirt.appendChild(el);
-  $("stage").appendChild(shirt);
+  $("cam").appendChild(shirt);
 }
 
 function layoutSleeves(availW, availH) {
@@ -403,13 +420,9 @@ function layoutSleeves(availW, availH) {
     shape.style.width = sw * state.ppm + "px";
     shape.style.height = sh * state.ppm + "px";
     // Тычок по ткани мимо зоны выбирает этот рукав — иначе поле вокруг зоны
-    // оказалось бы мёртвым, хотя выглядит как часть схемы.
-    shape.addEventListener("pointerdown", (e) => {
-      if (e.target !== shape) return;
-      state.sel = null;
-      if (!state.viewMode && state.target !== side) { state.target = side; layoutRefresh(); }
-      else refreshFlags();
-    });
+    // оказалось бы мёртвым, хотя выглядит как часть схемы. Сам тап ловит
+    // сцена (stageTap), рукав узнаёт по data-side.
+    shape.dataset.side = side;
 
     const el = makeZone(side);
     el.style.left = (sw - z.w_mm) / 2 * state.ppm + "px";
@@ -420,15 +433,55 @@ function layoutSleeves(availW, availH) {
     block.appendChild(shape);
     wrap.appendChild(block);
   }
-  $("stage").appendChild(wrap);
+  $("cam").appendChild(wrap);
 }
 
-/* Габарит, которым принт держится в зоне. Поворот его не меняет: на углах,
-   кратных 90°, картинка честно совпадает с прямоугольником, на остальных
-   углы принта выходят за пунктир — это разрешено сознательно, иначе
-   свободный поворот упирался бы в рамку на каждом шаге. */
-function halfDims(p) {
-  return [p.s.width_mm / 2, p.s.height_mm / 2];
+/* Полугабариты прямоугольника w×h, повёрнутого на deg: описанный вокруг
+   него прямоугольник по осям зоны. Раньше габарит не поворачивался, и на
+   промежуточных углах принт вылезал за пунктир. */
+function extents(w, h, deg) {
+  const r = deg * Math.PI / 180;
+  const c = Math.abs(Math.cos(r)), s = Math.abs(Math.sin(r));
+  return [(w * c + h * s) / 2, (w * s + h * c) / 2];
+}
+
+/* Габарит, которым принт держится в зоне и держит просвет до соседа */
+function halfDims(p, deg = p.rotation) {
+  return extents(p.s.width_mm, p.s.height_mm, deg);
+}
+
+/* Влезает ли принт в свою зону под углом deg */
+function fitsAt(p, deg) {
+  const z = zoneOf(p.side);
+  const [hw, hh] = halfDims(p, deg);
+  return hw * 2 <= z.w_mm + 0.01 && hh * 2 <= z.h_mm + 0.01;
+}
+
+/* Поворот к углу target, упираясь в рамку: если по дороге принт перестаёт
+   влезать в зону, останавливаемся на последнем угле, где он ещё влезал.
+   Идём по градусу — угол всё равно целый. */
+function rotateToward(p, target) {
+  const cur = Math.round(p.rotation);
+  target = normAngle(Math.round(target));
+  if (fitsAt(p, target)) return { angle: target, blocked: false };
+  const d = ((target - cur + 540) % 360) - 180;
+  const dir = Math.sign(d);
+  let last = cur;
+  for (let i = 1; i <= Math.abs(d); i++) {
+    const a = normAngle(cur + i * dir);
+    if (!fitsAt(p, a)) break;
+    last = a;
+  }
+  return { angle: last, blocked: true };
+}
+
+/* Поворот упёрся в рамку: подсвечиваем зону и один раз даём отдачу */
+function bumpZone(side) {
+  const z = state.zoneEls[side];
+  if (!z) return;
+  z.classList.add("bump");
+  clearTimeout(z._bump);
+  z._bump = setTimeout(() => z.classList.remove("bump"), 380);
 }
 
 function fitsZone(s, side) {
@@ -439,8 +492,11 @@ function fitsZone(s, side) {
 function clamp(p) {
   const z = zoneOf(p.side);
   const [hw, hh] = halfDims(p);
-  p.x_mm = Math.min(z.w_mm / 2 - hw, Math.max(-(z.w_mm / 2 - hw), p.x_mm));
-  p.y_mm = Math.min(z.h_mm - hh, Math.max(hh, p.y_mm));
+  // Если габарит шире зоны (так быть не должно — поворот это не пускает),
+  // ставим по центру, а не разносим координаты в разные стороны.
+  const mx = Math.max(0, z.w_mm / 2 - hw);
+  p.x_mm = Math.min(mx, Math.max(-mx, p.x_mm));
+  p.y_mm = hh * 2 >= z.h_mm ? z.h_mm / 2 : Math.min(z.h_mm - hh, Math.max(hh, p.y_mm));
 }
 
 /* Между принтами нужен просвет: пресс жмёт наклейки по одной, и край
@@ -543,6 +599,7 @@ function selectPlaced(uid) {
 
 function setView(v) {
   state.view = v;
+  resetCam();
   document.querySelectorAll(".side-tab").forEach(x =>
     x.classList.toggle("active", x.dataset.view === v));
   layout(); renderAll(); renderCatalog();
@@ -629,7 +686,7 @@ function attachDrag(el, p) {
   const pts = new Map();
   let mode = null;               // move | rotate2
   let startX, startY, sx, sy, snappedX = false;
-  let baseRot = 0, baseAng = 0, snappedRot = null;
+  let baseRot = 0, baseAng = 0, snappedRot = null, bumped = false;
 
   const pairAngle = () => {
     const [a, b] = [...pts.values()];
@@ -646,7 +703,7 @@ function attachDrag(el, p) {
 
     if (pts.size >= 2) {
       mode = "rotate2";
-      baseRot = p.rotation; baseAng = pairAngle(); snappedRot = null;
+      baseRot = p.rotation; baseAng = pairAngle(); snappedRot = null; bumped = false;
     } else {
       mode = "move";
       startX = e.clientX; startY = e.clientY; sx = p.x_mm; sy = p.y_mm;
@@ -660,17 +717,23 @@ function attachDrag(el, p) {
     pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (mode === "rotate2" && pts.size >= 2) {
-      const next = snapAngle(baseRot + (pairAngle() - baseAng));
-      if (next % 90 === 0 && snappedRot !== next) { haptic("medium"); snappedRot = next; }
-      if (next % 90 !== 0) snappedRot = null;
-      p.rotation = next;
-      place(el, p); clamp(p); place(el, p); updateTele();
+      const want = snapAngle(baseRot + (pairAngle() - baseAng));
+      const { angle, blocked } = rotateToward(p, want);
+      if (blocked) {
+        if (!bumped) { haptic("heavy"); bumpZone(p.side); bumped = true; }
+      } else bumped = false;
+      if (angle % 90 === 0 && snappedRot !== angle) { haptic("medium"); snappedRot = angle; }
+      if (angle % 90 !== 0) snappedRot = null;
+      p.rotation = angle;
+      clamp(p); place(el, p); refreshFlags();
       return;
     }
     if (mode !== "move" || startX == null) return;
 
-    p.x_mm = sx + (e.clientX - startX) / state.ppm;
-    p.y_mm = sy + (e.clientY - startY) / state.ppm;
+    // Экранные пиксели в миллиметры: с учётом приближения сцены
+    const k = state.ppm * state.cam.z;
+    p.x_mm = sx + (e.clientX - startX) / k;
+    p.y_mm = sy + (e.clientY - startY) / k;
     if (Math.abs(p.x_mm) < 4) {                 // снап к центральной оси
       p.x_mm = 0;
       if (!snappedX) { haptic("medium"); snappedX = true; }
@@ -700,7 +763,7 @@ function attachDrag(el, p) {
 }
 
 function attachRotate(handle, el, p) {
-  let active = false, baseRot = 0, baseAng = 0, snapped = null;
+  let active = false, baseRot = 0, baseAng = 0, snapped = null, bumped = false;
   const angTo = (e) => {
     const c = centerOf(el);
     return Math.atan2(e.clientY - c.y, e.clientX - c.x) * 180 / Math.PI;
@@ -708,7 +771,7 @@ function attachRotate(handle, el, p) {
   handle.addEventListener("pointerdown", (e) => {
     e.preventDefault(); e.stopPropagation();
     handle.setPointerCapture(e.pointerId);
-    active = true; baseRot = p.rotation; baseAng = angTo(e); snapped = null;
+    active = true; baseRot = p.rotation; baseAng = angTo(e); snapped = null; bumped = false;
     state.sel = p.uid;
     document.body.classList.add("dragging");
     refreshFlags();
@@ -716,11 +779,15 @@ function attachRotate(handle, el, p) {
   handle.addEventListener("pointermove", (e) => {
     if (!active) return;
     e.stopPropagation();
-    const next = snapAngle(baseRot + (angTo(e) - baseAng));
-    if (next % 90 === 0 && snapped !== next) { haptic("medium"); snapped = next; }
-    if (next % 90 !== 0) snapped = null;
-    p.rotation = next;
-    clamp(p); place(el, p); updateTele();
+    const want = snapAngle(baseRot + (angTo(e) - baseAng));
+    const { angle, blocked } = rotateToward(p, want);
+    if (blocked) {
+      if (!bumped) { haptic("heavy"); bumpZone(p.side); bumped = true; }
+    } else bumped = false;
+    if (angle % 90 === 0 && snapped !== angle) { haptic("medium"); snapped = angle; }
+    if (angle % 90 !== 0) snapped = null;
+    p.rotation = angle;
+    clamp(p); place(el, p); refreshFlags();
   });
   const stop = (e) => {
     if (!active) return;
@@ -1310,9 +1377,24 @@ $("btnSort").onclick = () => {
   renderCatalog();
 };
 
+/* Поворот на 90°. Бывает, что боком принт в зону не влезает (высокий
+   принт на рукаве) — тогда берём следующий угол, кратный 90°, который
+   влезает, и говорим об этом. */
 $("btnRotate").onclick = () => {
   const p = state.placed.find(p => p.uid === state.sel); if (!p) return;
-  p.rotation = normAngle(Math.round(p.rotation / 90) * 90 + 90);
+  const base = normAngle(Math.round(p.rotation / 90) * 90);
+  let next = null;
+  for (const k of [1, 2, 3]) {
+    const a = normAngle(base + 90 * k);
+    if (fitsAt(p, a)) { next = { a, k }; break; }
+  }
+  if (!next) {
+    toast("Повёрнутым этот принт в зону не помещается", { warn: true });
+    bumpZone(p.side); haptic("heavy");
+    return;
+  }
+  if (next.k === 2) toast("Боком не помещается — перевернули на 180°", { ms: 2200 });
+  p.rotation = next.a;
   clamp(p); renderAll(); haptic();
 };
 $("btnDelete").onclick = removeSelected;
@@ -1321,6 +1403,185 @@ $("coBack").onclick = closeCheckout;
 $("coSubmit").onclick = submitOrder;
 $("pickBack").onclick = closePicker;
 window.addEventListener("resize", () => { layout(); renderAll(); });
+
+/* ---------- Приближение ---------- */
+
+/* Где на экране левый верхний угол камеры при нулевом сдвиге. offsetLeft
+   трансформацию не учитывает — это ровно то, что нужно. */
+function camOrigin() {
+  const stage = $("stage"), cam = $("cam");
+  const r = stage.getBoundingClientRect();
+  return { x: r.left + stage.clientLeft + cam.offsetLeft,
+           y: r.top + stage.clientTop + cam.offsetTop, r };
+}
+
+/* Не даём увести футболку со сцены. Приближённую можно сдвинуть так, чтобы
+   её край дошёл до края сцены с небольшим запасом — под список принтов
+   и подсказки. На 1× сдвига нет вовсе. */
+function clampCam() {
+  const c = state.cam, cam = $("cam");
+  if (!cam) return;
+  if (c.z <= 1.001) { c.z = 1; c.x = 0; c.y = 0; return; }
+  const o = camOrigin();
+  const w = cam.offsetWidth * c.z, h = cam.offsetHeight * c.z;
+  const pad = 48;
+  const lim = (lo, hi, size, org) => {
+    const span = hi - lo;
+    return size > span
+      ? [hi - pad - org - size, lo + pad - org]
+      : [lo - org, hi - org - size];
+  };
+  const [x0, x1] = lim(o.r.left, o.r.right, w, o.x);
+  const [y0, y1] = lim(o.r.top, o.r.bottom, h, o.y);
+  c.x = Math.min(Math.max(c.x, Math.min(x0, x1)), Math.max(x0, x1));
+  c.y = Math.min(Math.max(c.y, Math.min(y0, y1)), Math.max(y0, y1));
+}
+
+function applyCam() {
+  const cam = $("cam");
+  if (!cam) return;
+  clampCam();
+  const c = state.cam;
+  cam.style.transform = `translate(${c.x}px, ${c.y}px) scale(${c.z})`;
+  // --z гасит приближение у ручки, подписей и обводок — они остаются
+  // экранного размера, а не раздуваются вместе с футболкой.
+  $("stage").style.setProperty("--z", c.z);
+  document.body.classList.toggle("zoomed", c.z > 1);
+  $("zoomOut").disabled = c.z <= 1;
+  $("zoomIn").disabled = c.z >= ZOOM_MAX - 0.001;
+}
+
+function resetCam() { state.cam = { z: 1, x: 0, y: 0 }; }
+
+/* Приблизить до z так, чтобы точка экрана (fx, fy) осталась под пальцем */
+function zoomAt(z, fx, fy) {
+  const c = state.cam, o = camOrigin();
+  const lx = (fx - o.x - c.x) / c.z, ly = (fy - o.y - c.y) / c.z;
+  c.z = Math.min(ZOOM_MAX, Math.max(1, z));
+  c.x = fx - o.x - c.z * lx;
+  c.y = fy - o.y - c.z * ly;
+  applyCam();
+}
+
+function zoomCenter(z) {
+  const r = $("stage").getBoundingClientRect();
+  zoomAt(z, r.left + r.width / 2, r.top + r.height / 2);
+  haptic();
+}
+
+$("zoomIn").onclick = () => zoomCenter(state.cam.z * ZOOM_STEP);
+$("zoomOut").onclick = () => zoomCenter(state.cam.z / ZOOM_STEP < 1.15 ? 1 : state.cam.z / ZOOM_STEP);
+
+/* Жесты по пустому месту сцены (не по принту — у принта свои):
+   один палец на приближённой футболке — сдвиг, два — щипок,
+   короткий тап — выбор зоны, двойной тап — приблизить или вернуть 1×. */
+(function stageGestures() {
+  const stage = $("stage");
+  const pts = new Map();
+  let mode = null;                 // null | tap | pan | pinch
+  let downAt = 0, downTarget = null, start = null;
+  let base = null;                 // снимок камеры на старте жеста
+  let lastTap = { t: 0, x: 0, y: 0 };
+
+  const mid = () => {
+    const [a, b] = [...pts.values()];
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2,
+             d: Math.hypot(b.x - a.x, b.y - a.y) || 1 };
+  };
+  const capture = () => {
+    for (const id of pts.keys()) {
+      try { stage.setPointerCapture(id); } catch (e) { /* палец уже ушёл */ }
+    }
+    document.body.classList.add("dragging");
+  };
+
+  stage.addEventListener("pointerdown", (e) => {
+    if (e.target.closest(".sticker")) return;
+    // Второй палец мимо принта, пока первый его тащит или крутит, —
+    // это не жест сцены: камеру в этот момент не трогаем.
+    if (!pts.size && document.body.classList.contains("dragging")) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 1) {
+      mode = "tap"; downAt = Date.now(); downTarget = e.target;
+      start = { x: e.clientX, y: e.clientY };
+      base = { ...state.cam };
+      // На приближённой футболке палец почти наверняка начнёт сдвиг:
+      // сразу глушим прокрутку, чтобы Telegram не принял его за «свернуть».
+      if (state.cam.z > 1) document.body.classList.add("dragging");
+    } else if (pts.size === 2) {
+      const m = mid(), o = camOrigin(), c = state.cam;
+      mode = "pinch";
+      base = { z: c.z, d: m.d, lx: (m.x - o.x - c.x) / c.z, ly: (m.y - o.y - c.y) / c.z };
+      capture();
+    }
+  });
+
+  stage.addEventListener("pointermove", (e) => {
+    if (!pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (mode === "pinch" && pts.size >= 2) {
+      const m = mid(), o = camOrigin(), c = state.cam;
+      c.z = Math.min(ZOOM_MAX, Math.max(1, base.z * m.d / base.d));
+      c.x = m.x - o.x - c.z * base.lx;
+      c.y = m.y - o.y - c.z * base.ly;
+      applyCam();
+      return;
+    }
+    if (mode === "tap") {
+      const moved = Math.hypot(e.clientX - start.x, e.clientY - start.y);
+      if (moved > TAP_SLOP) {
+        if (state.cam.z > 1) { mode = "pan"; capture(); }
+        else mode = null;          // на 1× двигать нечего — это не тап и не сдвиг
+      }
+    }
+    if (mode === "pan") {
+      state.cam.x = base.x + (e.clientX - start.x);
+      state.cam.y = base.y + (e.clientY - start.y);
+      applyCam();
+    }
+  });
+
+  const end = (e) => {
+    if (!pts.has(e.pointerId)) return;
+    pts.delete(e.pointerId);
+    if (mode === "tap" && e.type === "pointerup" && Date.now() - downAt < 500) {
+      stageTap(e, downTarget);
+    }
+    if (pts.size === 0) {
+      mode = null;
+      document.body.classList.remove("dragging");
+    } else if (mode === "pinch") {
+      // остался один палец — продолжаем сдвигом от его текущего места
+      const [p] = [...pts.values()];
+      mode = state.cam.z > 1 ? "pan" : null;
+      start = { x: p.x, y: p.y };
+      base = { ...state.cam };
+    }
+  };
+  stage.addEventListener("pointerup", end);
+  stage.addEventListener("pointercancel", end);
+
+  function stageTap(e, target) {
+    const now = Date.now();
+    const dbl = now - lastTap.t < DOUBLE_TAP_MS
+      && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30;
+    lastTap = dbl ? { t: 0, x: 0, y: 0 } : { t: now, x: e.clientX, y: e.clientY };
+    if (dbl && !target?.closest?.(".zone-ghost")) {
+      if (state.cam.z > 1) { resetCam(); applyCam(); }
+      else zoomAt(ZOOM_TAP, e.clientX, e.clientY);
+      haptic();
+      return;
+    }
+    // Одиночный тап по пустому месту: снимаем выделение; по зоне или
+    // рукаву другой стороны — переключаем, куда кладём следующий принт.
+    const host = target?.closest?.("[data-side]");
+    state.sel = null;
+    if (host && !state.viewMode && state.target !== host.dataset.side) {
+      state.target = host.dataset.side;
+      layoutRefresh();
+    } else refreshFlags();
+  }
+})();
 
 /* Пока тащим принт, страница не должна прокручиваться: именно эта прокрутка
    на телефоне и превращается в жест «свернуть мини-апп». Каталога и экрана
