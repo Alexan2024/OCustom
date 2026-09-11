@@ -1,6 +1,7 @@
 """HTTP API для мини-аппа + раздача статики."""
 import asyncio
 import logging
+import math
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -172,19 +173,29 @@ def calc_goods_price(n_items: int) -> int:
 calc_price = calc_goods_price
 
 
+def rotated_half(w: float, h: float, deg: float) -> tuple[float, float]:
+    """Полугабариты прямоугольника w×h, повёрнутого на deg: описанный вокруг
+    него прямоугольник по осям зоны. Та же формула, что extents() в app.js."""
+    r = math.radians(deg)
+    c, s = abs(math.cos(r)), abs(math.sin(r))
+    return (w * c + h * s) / 2, (w * s + h * c) / 2
+
+
 def validate_geometry(size: str, items: list[Item], stickers: dict):
     """Каждый принт должен лежать в своей зоне и не подходить к соседу
     ближе, чем на MIN_GAP_MM: пресс жмёт наклейки по одной, и край платена
     не должен накрыть уже запечатанный принт.
 
     Поворот свободный, 0..359°. Габарит, по которому считается попадание
-    в зону и просвет до соседа, всегда неповёрнутый — ровно так же считает
-    мини-апп. На промежуточных углах углы принта могут выйти за пунктир:
-    это допущено сознательно, отступы зоны (шов, низ, горловина) такой
-    выход переживают.
+    в зону и просвет до соседа, поворачивается вместе с принтом — ровно
+    так же считает мини-апп. Раньше габарит был неповёрнутый, и на
+    промежуточных углах принт выходил за пунктир.
     """
     boxes: dict[str, list] = {s: [] for s in config.SIDES}
     gap = config.MIN_GAP_MM
+    # Мини-апп шлёт координаты с точностью 0,1 мм: без допуска сервер мог
+    # завернуть раскладку, которую мини-апп только что показал как верную.
+    gap_check = gap - 0.2
     for it in items:
         s = stickers.get(it.sticker_id)
         if not s:
@@ -193,11 +204,12 @@ def validate_geometry(size: str, items: list[Item], stickers: dict):
         w, h = s["width_mm"], s["height_mm"]
         if not 0 <= it.rotation <= 359:
             raise HTTPException(400, "Поворот должен быть от 0 до 359°")
-        if w > z["w_mm"] + 0.5 or h > z["h_mm"] + 0.5:
+        half_w, half_h = rotated_half(w, h, it.rotation)
+        if half_w * 2 > z["w_mm"] + 0.5 or half_h * 2 > z["h_mm"] + 0.5:
+            angle = f" под углом {it.rotation}°" if it.rotation % 180 else ""
             raise HTTPException(
-                400, f"«{s['name']}» не помещается в зону "
+                400, f"«{s['name']}»{angle} не помещается в зону "
                      f"({z['w_mm']:.0f}×{z['h_mm']:.0f} мм)")
-        half_w, half_h = w / 2, h / 2
         # внутри печатной зоны
         if (abs(it.x_mm) + half_w > z["w_mm"] / 2 + 0.5
                 or it.y_mm - half_h < -0.5
@@ -206,8 +218,8 @@ def validate_geometry(size: str, items: list[Item], stickers: dict):
         # просвет до соседей на той же стороне
         box = (it.x_mm - half_w, it.y_mm - half_h, it.x_mm + half_w, it.y_mm + half_h)
         for b in boxes[it.side]:
-            if (box[0] < b[2] + gap and box[2] > b[0] - gap
-                    and box[1] < b[3] + gap and box[3] > b[1] - gap):
+            if (box[0] < b[2] + gap_check and box[2] > b[0] - gap_check
+                    and box[1] < b[3] + gap_check and box[3] > b[1] - gap_check):
                 raise HTTPException(
                     400, f"Между принтами нужно хотя бы {gap} мм — иначе пресс "
                          "заденет соседний")
