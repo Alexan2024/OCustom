@@ -84,7 +84,14 @@ body {
 /* ---------- Сцена ---------- */
 
 .stage-wrap { flex: 1; position: relative; display: flex; flex-direction: column; min-height: 0; }
-.stage { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
+.stage {
+  flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0;
+  position: relative; overflow: hidden;   /* приближённая футболка не лезет на панели */
+}
+/* Камера: всё содержимое сцены. Её transform и есть приближение и сдвиг,
+   ставит его applyCam(). --z (на .stage) гасит зум у ручки, подписей
+   и обводок — они остаются экранного размера. */
+.cam { position: relative; flex: 0 0 auto; transform-origin: 0 0; }
 /* Освобождаем место под список принтов, чтобы он не лёг на футболку */
 body.has-layers .stage { padding-right: 56px; }
 .shirt { position: relative; }
@@ -92,7 +99,7 @@ body.has-layers .stage { padding-right: 56px; }
 
 /* Печатная зона — техкарта: рамка, центральная ось, мм-риски */
 .zone {
-  position: absolute; border: 1px dashed var(--grid);
+  position: absolute; border: calc(1px / var(--z, 1)) dashed var(--grid);
   background:
     repeating-linear-gradient(to right, var(--grid) 0 1px, transparent 1px 100%),
     repeating-linear-gradient(to bottom, var(--grid) 0 1px, transparent 1px 100%);
@@ -102,21 +109,25 @@ body.has-layers .stage { padding-right: 56px; }
   transition: border-color .18s var(--ease), opacity .2s var(--ease);
 }
 .zone.target { border-color: var(--accent-weak); }
+/* Поворот упёрся в рамку: принт под таким углом в зону не влезает */
+.zone.bump, .zone.target.bump { border-color: var(--danger); border-style: solid; }
 .zone-center {
   position: absolute; left: 50%; top: 0; bottom: 0; width: 0;
-  border-left: 1px dashed var(--accent-weak);
+  border-left: calc(1px / var(--z, 1)) dashed var(--accent-weak);
   transition: border-color .12s var(--ease);
 }
 .zone-center.lit { border-left-style: solid; border-left-color: var(--on-shirt); }
 .zone-tag {
-  position: absolute; left: 0; top: -15px;
+  position: absolute; left: 0; top: calc(-15px / var(--z, 1));
+  transform: scale(calc(1 / var(--z, 1))); transform-origin: 0 0;
   font-family: var(--mono); font-size: 9px; color: var(--muted); white-space: nowrap;
 }
 
 /* Пустая зона: куда класть */
 /* Подсказка в пустой зоне: только текст поверх футболки, без плашки */
 .zone-ghost {
-  position: absolute; left: 50%; top: 30%; transform: translate(-50%, -50%);
+  position: absolute; left: 50%; top: 30%;
+  transform: translate(-50%, -50%) scale(calc(1 / var(--z, 1)));
   display: flex; flex-direction: column; align-items: center; gap: 4px;
   color: #fff; font-size: 13px; text-align: center; white-space: nowrap;
   border: 0; background: none; padding: 6px; cursor: pointer;
@@ -142,6 +153,7 @@ body.has-layers .stage { padding-right: 56px; }
   border-bottom: 1px solid var(--line-2); pointer-events: none;
 }
 .sleeve-label {
+  transform: scale(calc(1 / var(--z, 1))); transform-origin: 50% 100%;
   font-family: var(--mono); font-size: 11px; color: var(--muted);
   text-transform: lowercase; letter-spacing: .04em;
 }
@@ -152,11 +164,16 @@ body.has-layers .stage { padding-right: 56px; }
 .sticker { position: absolute; touch-action: none; cursor: grab; user-select: none; }
 .sticker img { width: 100%; height: 100%; display: block; pointer-events: none; }
 /* Выделенный принт поднимаем над соседями, иначе его не подцепить пальцем */
-.sticker.selected { outline: 1.5px solid var(--on-shirt); outline-offset: 2px; z-index: 5; }
-.sticker.overlap { outline: 1.5px solid var(--danger); outline-offset: 2px; }
-.sticker.gone { outline: 1.5px dashed var(--danger); outline-offset: 2px; opacity: .5; }
+.sticker {
+  --ow: calc(1.5px / var(--z, 1));       /* обводка и отступ — экранного размера */
+  --oo: calc(2px / var(--z, 1));
+}
+.sticker.selected { outline: var(--ow) solid var(--on-shirt); outline-offset: var(--oo); z-index: 5; }
+.sticker.overlap { outline: var(--ow) solid var(--danger); outline-offset: var(--oo); }
+.sticker.gone { outline: var(--ow) dashed var(--danger); outline-offset: var(--oo); opacity: .5; }
 .sticker .dim {
-  position: absolute; left: 50%; bottom: -16px; transform: translateX(-50%);
+  position: absolute; left: 50%; top: calc(100% + 3px / var(--z, 1));
+  transform: translateX(-50%) scale(calc(1 / var(--z, 1))); transform-origin: 50% 0;
   font-family: var(--mono); font-size: 9px; color: var(--muted); white-space: nowrap;
 }
 .sticker.selected .dim { color: var(--on-shirt); }
@@ -167,6 +184,7 @@ body.has-layers .stage { padding-right: 56px; }
   border-radius: 50%; background: var(--surface); border: 1px solid var(--line-2);
   color: var(--accent); font-size: 13px; line-height: 24px; text-align: center;
   cursor: grab; touch-action: none; box-shadow: 0 1px 4px rgba(0, 0, 0, .12);
+  transform: scale(calc(1 / var(--z, 1)));   /* центр ручки — ровно в углу */
 }
 .sticker:not(.selected) .rot-handle { display: none; }
 
@@ -194,6 +212,21 @@ body.has-layers .stage { padding-right: 56px; }
   background: var(--bg); border-radius: 4px; padding: 2px 3px;
 }
 .layer.active .tag { color: var(--accent); }
+
+/* Приближение: «+» и «−» слева внизу. Щипок и двойной тап работают и без них */
+.zoom {
+  position: absolute; left: 10px; bottom: 30px;
+  display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .06); overflow: hidden;
+}
+.zoom button {
+  width: 34px; height: 34px; border: 0; background: none; color: var(--text);
+  font-family: var(--mono); font-size: 17px; line-height: 1; cursor: pointer;
+  transition: opacity .16s var(--ease);
+}
+.zoom button + button { border-top: 1px solid var(--line); }
+.zoom button:disabled { opacity: .3; cursor: default; }
 
 /* Телеметрия: где именно лежит выбранный принт */
 .tele {
