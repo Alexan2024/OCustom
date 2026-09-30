@@ -6,7 +6,7 @@ import time
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats,
-                           BufferedInputFile, CallbackQuery,
+                           BotCommandScopeChat, BufferedInputFile, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup,
                            Message, WebAppInfo)
 
@@ -118,7 +118,11 @@ def start_kb():
 
 
 async def setup_commands():
-    """Меню команд бота (кнопка «/» рядом с полем ввода)."""
+    """Меню команд бота (кнопка «/» рядом с полем ввода).
+
+    У покупателя в личке — свои три команды, в чате сотрудников — рабочие.
+    Меню в группе нужно, чтобы про /pause и /stock не приходилось помнить.
+    """
     try:
         await bot.set_my_commands(
             [BotCommand(command="start", description="Собрать футболку"),
@@ -128,6 +132,19 @@ async def setup_commands():
         )
     except Exception as e:
         log.warning("Не удалось установить меню команд: %s", e)
+    if not config.STAFF_CHAT_ID:
+        return
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command="stock", description="Остаток футболок"),
+             BotCommand(command="pause", description="Поставить приём заказов на паузу"),
+             BotCommand(command="resume", description="Снять паузу"),
+             BotCommand(command="receipt", description="Что с чеком: /receipt 42"),
+             BotCommand(command="diag", description="Проверить настройки")],
+            scope=BotCommandScopeChat(chat_id=config.STAFF_CHAT_ID),
+        )
+    except Exception as e:
+        log.warning("Не удалось установить меню команд в чате сотрудников: %s", e)
 
 
 # ---------- Команды ----------
@@ -156,6 +173,14 @@ async def diag(m: Message):
     if config.STAFF_CHAT_ID and m.chat.id != config.STAFF_CHAT_ID:
         return
     lines = [f"🩺 {config.BRAND}, состояние", ""]
+
+    pause = db.get_pause()
+    if pause:
+        lines.append(f"Приём заказов: ⏸ НА ПАУЗЕ с {_when(pause.get('since'))}"
+                     f"{_who(pause)} — снять: /resume")
+    else:
+        lines.append("Приём заказов: открыт")
+    lines.append("")
 
     lines.append(f"Режим оплаты: {config.PAYMENT_MODE}")
     if config.PAYMENT_MODE not in ("manual", "yookassa"):
@@ -320,6 +345,103 @@ async def staff_stock_edit(cb: CallbackQuery):
         pass   # «message is not modified» — жали кнопку, ничего не изменилось
 
 
+# ---------- Пауза приёма заказов ----------
+
+def _when(stamp: str | None) -> str:
+    """«2026-09-29 15:40:12» → «29.09 в 15:40»."""
+    try:
+        d, t = (stamp or "").split(" ")
+        _, mo, dd = d.split("-")
+        return f"{dd}.{mo} в {t[:5]}"
+    except ValueError:
+        return stamp or "—"
+
+
+def _who(pause: dict) -> str:
+    return f" ({pause['by']})" if pause.get("by") else ""
+
+
+def _staff_name(u) -> str:
+    return f"@{u.username}" if u.username else (u.full_name or str(u.id))
+
+
+def pause_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Снять паузу ▶️", callback_data="pause:off")
+    ]])
+
+
+def pause_status_text(pause: dict, head: str) -> str:
+    return (
+        f"{head}\n\n"
+        f"Покупатели видят:\n«{pause['text']}»\n\n"
+        f"На паузе с {_when(pause.get('since'))}{_who(pause)}.\n\n"
+        "Новые заказы мини-апп не принимает: собрать футболку можно, "
+        "оформить нельзя. Всё, что уже оформлено, работает как обычно — "
+        "оплата по выпущенным ссылкам, кнопки в карточках, СДЭК, «Мои заказы».\n\n"
+        "Поменять текст: /pause Вернёмся 5 октября\n"
+        "Снять: /resume"
+    )
+
+
+@dp.message(Command("pause"))
+async def pause_cmd(m: Message, command: CommandObject):
+    """/pause — закрыть приём заказов. /pause текст — со своим объявлением
+    (его видят покупатели). Повторный /pause с текстом меняет объявление.
+    Работает только в чате сотрудников."""
+    if config.STAFF_CHAT_ID and m.chat.id != config.STAFF_CHAT_ID:
+        return
+    text = (command.args or "").strip()
+    was = db.get_pause()
+    if was and not text:
+        await m.answer(pause_status_text(was, "⏸ Пауза уже стоит."),
+                       reply_markup=pause_kb())
+        return
+    who = _staff_name(m.from_user)
+    now = db.set_pause(text or None, who)
+    if was:
+        log.info("Текст паузы изменён (%s): %s", who, now["text"])
+        head = "✏️ Текст паузы обновлён."
+    else:
+        log.info("Приём заказов на паузе (%s): %s", who, now["text"])
+        head = "⏸ Приём заказов на паузе."
+    await m.answer(pause_status_text(now, head), reply_markup=pause_kb())
+
+
+RESUMED_TEXT = ("▶️ Приём заказов открыт.\n\n"
+                "У тех, у кого мини-апп уже открыт, кнопка «Заказать» оживёт "
+                "в течение минуты.")
+
+
+@dp.message(Command("resume"))
+async def resume_cmd(m: Message):
+    if config.STAFF_CHAT_ID and m.chat.id != config.STAFF_CHAT_ID:
+        return
+    if db.clear_pause():
+        log.info("Пауза снята (%s)", _staff_name(m.from_user))
+        await m.answer(RESUMED_TEXT)
+    else:
+        await m.answer("Паузы нет — заказы и так принимаются.")
+
+
+@dp.callback_query(F.data == "pause:off")
+async def cb_resume(cb: CallbackQuery):
+    if config.STAFF_CHAT_ID and cb.message.chat.id != config.STAFF_CHAT_ID:
+        await cb.answer()
+        return
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass   # кнопку уже убрал кто-то другой
+    if db.clear_pause():
+        log.info("Пауза снята кнопкой (%s)", _staff_name(cb.from_user))
+        await cb.answer("Пауза снята")
+        await bot.send_message(cb.message.chat.id,
+                               f"{RESUMED_TEXT}\n\nСнял {_staff_name(cb.from_user)}.")
+    else:
+        await cb.answer("Паузы уже нет")
+
+
 @dp.message(Command("receipt"))
 async def receipt_check(m: Message, command: CommandObject):
     """/receipt 42 — что случилось с чеком по заказу.
@@ -443,8 +565,13 @@ async def start_deep(m: Message, command: CommandObject):
 async def start(m: Message):
     get_line = (f"📍 Самовывоз: {config.PICKUP_TEXT}\n🚚 Или доставка СДЭК по России."
                 if cdek.enabled() else f"📍 {config.PICKUP_TEXT}")
+    # Про паузу говорим сразу, а не когда человек соберёт футболку
+    # и упрётся в кнопку. Кнопки при этом те же: «Мои заказы» нужны и сейчас.
+    pause = db.get_pause()
+    pause_line = f"⏸ {pause['text']}\n\n" if pause else ""
     await m.answer(
         f"Привет! Это кастом-станция {config.BRAND}.\n\n"
+        f"{pause_line}"
         "Собери свою футболку: выбери принты, расставь их как хочешь — "
         "на груди, на спине и на рукавах. Мы запечатаем, а ты просто "
         "заберёшь готовую.\n\n"

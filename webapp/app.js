@@ -71,6 +71,8 @@ const state = {
   gone: new Set(),     // id принтов, которые разобрали, пока человек собирал
   catQuery: "",
   catBySize: false,
+  paused: false,       // сотрудник поставил приём заказов на паузу (/pause)
+  pauseText: "",       // что написать покупателю
   delivery: {
     method: "pickup",
     name: "", phone: "",
@@ -188,6 +190,7 @@ async function boot() {
     || Object.keys(cfg.sizes)[0];
   renderSizes(); renderCatalog(); layout(); renderAll(); updateBar();
   hideBoot();
+  setPause(cfg.pause, { announce: true });
 
   // Имя, телефон и почта, если человек их уже давал — чтобы не вводил заново
   fetch("/api/me", { headers: initHeaders() })
@@ -233,6 +236,7 @@ async function bootView(oid, key) {
    кто-то другой. Переспрашиваем каталог и помечаем то, чего уже нет. */
 async function refreshStock() {
   if (state.viewMode) return;
+  refreshPause();
   let list;
   try {
     list = await fetch("/api/stickers").then(r => r.json());
@@ -256,6 +260,65 @@ async function refreshStock() {
   }
   if (!$("sheet").classList.contains("hidden")) renderCatalog();
   renderAll();
+}
+
+/* ---------- Пауза приёма заказов ----------
+
+   Сотрудник ставит паузу командой /pause в рабочем чате. Конструктор при
+   этом открыт — собрать футболку можно, оформить нельзя. Сервер проверяет
+   паузу сам, так что здесь только честно показываем, что происходит. */
+
+function setPause(p, opts = {}) {
+  const on = !!p?.on;
+  const was = state.paused;
+  state.paused = on;
+  state.pauseText = on ? (p.text || "") : "";
+  updateBar();
+  if (on && !$("checkout").classList.contains("hidden")) closeCheckout();
+  const ov = $("overlay");
+  // Экран «Заказ принят» не перекрываем: человек уже всё оформил.
+  const busy = !ov.classList.contains("hidden") && ov.dataset.kind !== "pause";
+  if (on && !busy && (opts.announce || !was)) showPause();
+  if (on && $("pauseText")) $("pauseText").textContent = state.pauseText;
+  if (!on && was) {
+    hidePause();
+    toast("Приём заказов снова открыт", { ms: 3200 });
+    haptic();
+  }
+}
+
+async function refreshPause() {
+  let p;
+  try {
+    p = await fetch("/api/pause").then(r => r.json());
+  } catch (e) { return; }
+  if (!p || typeof p.on !== "boolean") return;
+  if (p.on !== state.paused || (p.on && p.text !== state.pauseText)) setPause(p);
+}
+
+function showPause() {
+  const ov = $("overlay");
+  ov.dataset.kind = "pause";
+  ov.innerHTML = `
+    <h2>Приём заказов на паузе</h2>
+    <p id="pauseText"></p>
+    <p class="fine">Конструктор открыт: собрать футболку можно, оформить —
+    когда откроемся. Раскладка не сохраняется.</p>
+    <div class="acts">
+      <button class="order-btn" id="pauseLook">Посмотреть конструктор</button>
+      <button class="ghost-btn" id="pauseClose">Закрыть</button>
+    </div>`;
+  $("pauseText").textContent = state.pauseText;
+  show(ov);
+  $("pauseLook").onclick = hidePause;
+  $("pauseClose").onclick = () => tg?.close?.();
+}
+
+function hidePause() {
+  const ov = $("overlay");
+  if (ov.dataset.kind !== "pause") return;
+  delete ov.dataset.kind;
+  hide(ov);
 }
 
 function markGone() {
@@ -915,12 +978,14 @@ function updateBar() {
   $("price").innerHTML = n
     ? `${goodsPrice()} ₽<small>${n} принт(а) · ${c.included_prints} включено</small>`
     : `${c.base_price} ₽<small>${c.included_prints} принта включено</small>`;
-  $("btnOrder").disabled = n === 0 || anyTooClose() || state.gone.size > 0;
+  $("btnOrder").disabled = state.paused || n === 0 || anyTooClose() || state.gone.size > 0;
+  $("btnOrder").textContent = state.paused ? "На паузе" : "Заказать";
 }
 
 /* ---------- Оформление ---------- */
 
 function openCheckout() {
+  if (state.paused) { showPause(); return; }
   // Экран нужен всегда, даже когда способ получения один: на нём человек
   // оставляет почту для чека и подтверждает условия возврата.
   show($("checkout"));
@@ -1306,8 +1371,12 @@ async function submitOrder() {
     return;
   }
   if (!r.ok) {
-    tg?.showAlert?.(data.detail || "Не получилось создать заказ");
     btn.disabled = false; btn.textContent = label;
+    // Пока человек оформлял, могли поставить паузу — тогда вместо
+    // окошка с ошибкой покажем экран паузы, он объясняет больше.
+    await refreshPause();
+    if (state.paused) return;
+    tg?.showAlert?.(data.detail || "Не получилось создать заказ");
     refreshStock();
     return;
   }
@@ -1328,6 +1397,7 @@ function showSuccess(data) {
     ? `<br><br>Чек придёт на ${data.receipt_email}.`
     : "";
   const ov = $("overlay");
+  delete ov.dataset.kind;
   ov.innerHTML = `
     <h2>Заказ принят</h2>
     <div class="num">№${data.order_id}</div>

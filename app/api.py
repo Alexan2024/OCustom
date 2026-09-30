@@ -58,7 +58,21 @@ def get_config():
             "short": config.RETURN_POLICY_SHORT,
             "full": config.RETURN_POLICY_TEXT,
         },
+        "pause": pause_state(),
     }
+
+
+def pause_state() -> dict:
+    """Стоит ли пауза приёма заказов и что написать покупателю."""
+    p = db.get_pause()
+    return {"on": True, "text": p["text"]} if p else {"on": False, "text": ""}
+
+
+@app.get("/api/pause")
+def get_pause():
+    """Мини-апп переспрашивает это вместе с остатками: сотрудник мог
+    поставить или снять паузу, пока человек собирает футболку."""
+    return pause_state()
 
 
 def receipt_email_mode() -> str:
@@ -289,6 +303,11 @@ async def resolve_delivery(d: DeliveryIn, goods: int) -> tuple[dict, str | None]
 async def create_order(body: NewOrder,
                        x_telegram_init_data: str | None = Header(default=None)):
     user = require_user(x_telegram_init_data)
+    # Пауза проверяется до расчёта доставки: незачем ходить в СДЭК ради
+    # заказа, который всё равно не примем. Окончательно решает db.create_order.
+    pause = db.get_pause()
+    if pause:
+        raise HTTPException(409, pause["text"])
     if body.size not in config.SIZES:
         raise HTTPException(400, "Неизвестный размер")
     if db.shirt_stock_of(body.size) <= 0:

@@ -1,4 +1,5 @@
 """SQLite. При 8–10 заказах в день этого хватает с запасом."""
+import json
 import logging
 import secrets
 import sqlite3
@@ -73,6 +74,11 @@ CREATE TABLE IF NOT EXISTS customers (
 CREATE TABLE IF NOT EXISTS shirt_stock (
     size TEXT PRIMARY KEY,       -- S | M | L | XL
     stock INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT ({NOW_SQL})
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,        -- переключатели, которые правят из чата
+    value TEXT,
     updated_at TEXT NOT NULL DEFAULT ({NOW_SQL})
 );
 """
@@ -249,6 +255,61 @@ def add_shirt_stock(size: str, delta: int) -> int:
     return new
 
 
+# ---------- Пауза приёма заказов ----------
+
+# Одна строка в settings: ключа нет — магазин открыт. Значение — JSON
+# с текстом для покупателя, временем и тем, кто поставил паузу.
+PAUSE_KEY = "pause"
+
+
+def get_pause(c=None) -> dict | None:
+    """Пауза, если она стоит: {"text", "since", "by"}. None — заказы принимаем."""
+    def _read(cc):
+        return cc.execute("SELECT value FROM settings WHERE key=?", (PAUSE_KEY,)).fetchone()
+
+    if c is not None:
+        row = _read(c)
+    else:
+        with conn() as cc:
+            row = _read(cc)
+    if not row or not row["value"]:
+        return None
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        data = {}
+    data["text"] = (data.get("text") or "").strip() or config.PAUSE_TEXT
+    return data
+
+
+def set_pause(text: str | None, by: str) -> dict:
+    """Ставит паузу или меняет её текст. Время начала при смене текста
+    не сдвигается — важно, с какого момента магазин закрыт, а не когда
+    переписали объявление."""
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        was = get_pause(c)
+        data = {
+            "text": (text or "").strip(),
+            "since": was["since"] if was else stamp(now_local()),
+            "by": was["by"] if was and not text else by,
+        }
+        c.execute(
+            f"INSERT INTO settings (key, value, updated_at) VALUES (?,?,{NOW_SQL}) "
+            f"ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at={NOW_SQL}",
+            (PAUSE_KEY, json.dumps(data, ensure_ascii=False)),
+        )
+    data["text"] = data["text"] or config.PAUSE_TEXT
+    return data
+
+
+def clear_pause() -> bool:
+    """Снимает паузу. True — пауза была и снята, False — её и не было."""
+    with conn() as c:
+        n = c.execute("DELETE FROM settings WHERE key=?", (PAUSE_KEY,)).rowcount
+    return n > 0
+
+
 def sync_stickers_from_csv():
     """Читает stickers/stickers.csv при каждом запуске.
 
@@ -416,6 +477,11 @@ def create_order(user, size: str, items: list, price: int,
     today = now_local().strftime("%Y-%m-%d")
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
+        # Пауза. Снаружи её проверяет и api.py, но решает эта проверка:
+        # сотрудник мог нажать /pause, пока считалась доставка.
+        pause = get_pause(c)
+        if pause:
+            raise OrderError(pause["text"])
         # квота (по умолчанию выключена: ONLINE_QUOTA_PER_DAY=0)
         if config.quota_enabled():
             n = c.execute(
